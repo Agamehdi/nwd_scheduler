@@ -1,0 +1,32 @@
+﻿Target_ID,Well_Name,Reservoir,Area,Pad,Rig,Target_Type,Start_Date,End_Date,Status,Priority,Progress_Pct,Owner,Campaign,Color,Notes,Duration_Days,Start_Year,End_Year
+NWD-003,B-001,Fasila,CA,N-Pad-02,,Producer,4/8/2026,5/22/2026,Completed,Medium,100,Mehdi,2026 Base,#8B5CF6,,45,2026,2026
+NWD-004,B-002,Fasila,CA,N-Pad-03,,Producer,6/1/2026,7/16/2026,In Progress,High,62,Mehdi,2026 Base,#F59E0B,,46,2026,2026
+NWD-007,B-003,Bal 10,CA,N-Pad-05,,Gas Injector,10/25/2026,12/15/2026,Not Started,Medium,0,Mehdi,2026 Base,#EC4899,,52,2026,2026
+NWD-010,B-004,Bal 8,CA,S-Pad-02,,Water Injector,3/5/2026,4/20/2026,Completed,Medium,100,Mehdi,2026 Base,#8B5CF6,,47,2026,2026
+NWD-012,B-005,Bal 78,CA,S-Pad-03,,Producer,6/12/2026,7/28/2026,In Progress,High,45,Mehdi,2026 Base,#F59E0B,,47,2026,2026
+NWD-014,B-006,Fasila D,CA,S-Pad-04,,Observation,9/19/2026,10/20/2026,Not Started,Low,0,Mehdi,2026 Base,#64748B,,32,2026,2026
+NWD-016,B-007,Bal 7,CA,S-Pad-06,,Appraisal,12/12/2026,2/2/2027,On Hold,Medium,0,Mehdi,2027 Base,#EF4444,,53,2026,2027
+,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,
