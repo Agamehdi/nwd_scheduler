@@ -1,16 +1,22 @@
 # -*- coding: utf-8 -*-
 """
-NWD Scheduler - Streamlit application
+NWD Scheduler v1.5 - Streamlit application
 
 Run:
-    streamlit run nwd_scheduler_app.py
+    streamlit run nwd_scheduler_v1.5.py
 
-Place NWD_Scheduler_Dummy_Input.xlsx in the same folder for automatic loading,
-or upload an Excel/CSV file through the application. Outputs are CSV-based.
+The application opens with an empty schedule. Upload an Excel/CSV schedule
+when required. Place SoR PDF documents in an "input" folder beside this Python
+file, or upload PDFs temporarily from the sidebar.
+
+Outputs are CSV-based.
 """
 
 from __future__ import annotations
 
+import base64
+import html
+import io
 import json
 import math
 import re
@@ -24,6 +30,7 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+import streamlit.components.v1 as components
 
 
 # -----------------------------------------------------------------------------
@@ -37,8 +44,10 @@ st.set_page_config(
 )
 
 APP_DIR = Path(__file__).resolve().parent
-DEFAULT_EXCEL = APP_DIR / "NWD_Scheduler_Dummy_Input.xlsx"
-LOCAL_SAVE_FILE = APP_DIR / "NWD_Scheduler_Latest.csv"
+DEFAULT_SOR_DIR = APP_DIR / "input"
+COMPUTED_COLUMNS = ["Duration_Days", "Start_Year", "End_Year"]
+INTERNAL_ROW_KEY = "__Original_Target_ID"
+HIGHLIGHT_COLOR = "#7C3AED"
 
 REQUIRED_COLUMNS = [
     "Target_ID",
@@ -56,6 +65,9 @@ REQUIRED_COLUMNS = [
     "Owner",
     "Campaign",
     "Color",
+    "Highlight",
+    "Highlight_Label",
+    "SoR_File",
     "Notes",
 ]
 
@@ -72,14 +84,20 @@ TEXT_COLUMNS = [
     "Owner",
     "Campaign",
     "Color",
+    "Highlight_Label",
+    "SoR_File",
     "Notes",
 ]
 
 DATE_COLUMNS = ["Start_Date", "End_Date"]
+BOOLEAN_COLUMNS = ["Highlight"]
 
 STATUS_OPTIONS = ["Not Started", "Ready", "In Progress", "On Hold", "Completed", "Cancelled"]
 PRIORITY_OPTIONS = ["Critical", "High", "Medium", "Low"]
-TARGET_TYPE_OPTIONS = ["Producer", "Water Injector", "Observation", "Disposal", "Appraisal"]
+TARGET_TYPE_OPTIONS = [
+    "Producer", "Water Injector", "Observation", "Disposal", "Appraisal",
+    "TAR", "Drilling Break", "Rig Maintenance", "Rig Move", "New Technology",
+]
 RESERVOIR_OPTIONS = ["Main Pay", "Upper Shale", "Mishrif", "Nahr Umr"]
 AREA_OPTIONS = ["North", "South"]
 
@@ -133,6 +151,17 @@ COLUMN_ALIASES = {
     "campaign": "Campaign",
     "color": "Color",
     "colour": "Color",
+    "highlight": "Highlight",
+    "highlighted": "Highlight",
+    "new technology": "Highlight",
+    "new_technology": "Highlight",
+    "highlight label": "Highlight_Label",
+    "highlight_label": "Highlight_Label",
+    "sor": "SoR_File",
+    "sor file": "SoR_File",
+    "sor_file": "SoR_File",
+    "sor document": "SoR_File",
+    "sor_document": "SoR_File",
     "notes": "Notes",
     "comments": "Notes",
 }
@@ -167,42 +196,9 @@ st.markdown(
 # -----------------------------------------------------------------------------
 # Data helpers
 # -----------------------------------------------------------------------------
-def create_dummy_dataframe() -> pd.DataFrame:
-    """Create deterministic, realistic NWD schedule data."""
-    records = [
-        ("NWD-001", "R-1401", "Main Pay", "North", "N-Pad-01", "Rig-101", "Producer", "2026-01-10", "2026-02-18", "Completed", "High", 100, "North MP Team", "2026 Base", "#2563EB", "Base development producer"),
-        ("NWD-002", "R-1402", "Main Pay", "North", "N-Pad-01", "Rig-101", "Water Injector", "2026-02-22", "2026-04-02", "Completed", "Critical", 100, "WI Team", "2026 Base", "#0EA5E9", "Pattern pressure support"),
-        ("NWD-003", "R-1403", "Upper Shale", "North", "N-Pad-02", "Rig-101", "Producer", "2026-04-08", "2026-05-22", "Completed", "Medium", 100, "US Team", "2026 Base", "#8B5CF6", "Upper Shale infill"),
-        ("NWD-004", "R-1404", "Mishrif", "North", "N-Pad-03", "Rig-101", "Producer", "2026-06-01", "2026-07-16", "In Progress", "High", 62, "Mishrif Team", "2026 Base", "#F59E0B", "Current drilling target"),
-        ("NWD-005", "R-1405", "Main Pay", "North", "N-Pad-03", "Rig-101", "Producer", "2026-07-20", "2026-09-03", "Ready", "High", 5, "North MP Team", "2026 Base", "#22C55E", "Materials confirmed"),
-        ("NWD-006", "R-1406", "Main Pay", "North", "N-Pad-04", "Rig-101", "Water Injector", "2026-09-08", "2026-10-18", "Not Started", "Critical", 0, "WI Team", "2026 Base", "#06B6D4", "PWRI linkage required"),
-        ("NWD-007", "R-1407", "Nahr Umr", "North", "N-Pad-05", "Rig-101", "Appraisal", "2026-10-25", "2026-12-15", "Not Started", "Medium", 0, "Nahr Umr Team", "2026 Base", "#EC4899", "Appraisal and coring"),
-        ("NWD-008", "R-1408", "Main Pay", "North", "N-Pad-05", "Rig-101", "Producer", "2027-01-05", "2027-02-18", "Not Started", "High", 0, "North MP Team", "2027 Base", "#2563EB", "Carry-over candidate"),
-        ("NWD-009", "R-2401", "Main Pay", "South", "S-Pad-01", "Rig-202", "Producer", "2026-01-15", "2026-02-28", "Completed", "High", 100, "South MP Team", "2026 Base", "#2563EB", "South development producer"),
-        ("NWD-010", "R-2402", "Mishrif", "South", "S-Pad-02", "Rig-202", "Producer", "2026-03-05", "2026-04-20", "Completed", "Medium", 100, "Mishrif Team", "2026 Base", "#8B5CF6", "Mishrif infill"),
-        ("NWD-011", "R-2403", "Main Pay", "South", "S-Pad-02", "Rig-202", "Water Injector", "2026-04-25", "2026-06-08", "Completed", "Critical", 100, "WI Team", "2026 Base", "#0EA5E9", "New injection pattern"),
-        ("NWD-012", "R-2404", "Upper Shale", "South", "S-Pad-03", "Rig-202", "Producer", "2026-06-12", "2026-07-28", "In Progress", "High", 45, "US Team", "2026 Base", "#F59E0B", "Directional well"),
-        ("NWD-013", "R-2405", "Main Pay", "South", "S-Pad-04", "Rig-202", "Producer", "2026-08-02", "2026-09-14", "Ready", "Medium", 0, "South MP Team", "2026 Base", "#22C55E", "Site ready"),
-        ("NWD-014", "R-2406", "Mishrif", "South", "S-Pad-04", "Rig-202", "Observation", "2026-09-19", "2026-10-20", "Not Started", "Low", 0, "Surveillance", "2026 Base", "#64748B", "Permanent gauge planned"),
-        ("NWD-015", "R-2407", "Main Pay", "South", "S-Pad-05", "Rig-202", "Producer", "2026-10-24", "2026-12-08", "Not Started", "High", 0, "South MP Team", "2026 Base", "#2563EB", "Facility dependency"),
-        ("NWD-016", "R-2408", "Nahr Umr", "South", "S-Pad-06", "Rig-202", "Appraisal", "2026-12-12", "2027-02-02", "On Hold", "Medium", 0, "Nahr Umr Team", "2027 Base", "#EF4444", "Pending subsurface maturation"),
-        ("NWD-017", "R-3401", "Main Pay", "North", "N-Pad-06", "Rig-303", "Producer", "2026-02-01", "2026-03-19", "Completed", "Medium", 100, "North MP Team", "2026 Base", "#2563EB", "Fast-track target"),
-        ("NWD-018", "R-3402", "Upper Shale", "North", "N-Pad-07", "Rig-303", "Producer", "2026-03-24", "2026-05-10", "Completed", "High", 100, "US Team", "2026 Base", "#8B5CF6", "Upper Shale campaign"),
-        ("NWD-019", "R-3403", "Main Pay", "North", "N-Pad-07", "Rig-303", "Water Injector", "2026-05-16", "2026-06-28", "Completed", "Critical", 100, "WI Team", "2026 Base", "#0EA5E9", "Injector conversion alternative"),
-        ("NWD-020", "R-3404", "Mishrif", "North", "N-Pad-08", "Rig-303", "Producer", "2026-07-05", "2026-08-18", "In Progress", "High", 20, "Mishrif Team", "2026 Base", "#F59E0B", "Possible overlap for conflict test"),
-        ("NWD-021", "R-3405", "Main Pay", "North", "N-Pad-08", "Rig-303", "Producer", "2026-08-12", "2026-09-25", "Ready", "High", 0, "North MP Team", "2026 Base", "#22C55E", "Intentional rig overlap example"),
-        ("NWD-022", "R-3406", "Main Pay", "South", "S-Pad-07", "Rig-303", "Producer", "2026-10-01", "2026-11-15", "Not Started", "Medium", 0, "South MP Team", "2026 Base", "#2563EB", "Rig move north to south"),
-        ("NWD-023", "R-3407", "Mishrif", "South", "S-Pad-08", "Rig-303", "Water Injector", "2026-11-20", "2027-01-05", "Not Started", "Critical", 0, "WI Team", "2027 Base", "#0EA5E9", "High value injector"),
-        ("NWD-024", "R-4401", "Main Pay", "North", "N-Pad-09", "Rig-404", "Producer", "2027-01-08", "2027-02-22", "Not Started", "High", 0, "North MP Team", "2027 Base", "#2563EB", "2027 opening target"),
-        ("NWD-025", "R-4402", "Upper Shale", "North", "N-Pad-10", "Rig-404", "Producer", "2027-03-01", "2027-04-14", "Not Started", "Medium", 0, "US Team", "2027 Base", "#8B5CF6", "Upper Shale target"),
-        ("NWD-026", "R-4403", "Main Pay", "South", "S-Pad-09", "Rig-404", "Water Injector", "2027-04-20", "2027-06-03", "Not Started", "Critical", 0, "WI Team", "2027 Base", "#0EA5E9", "Pattern support"),
-        ("NWD-027", "R-4404", "Mishrif", "South", "S-Pad-10", "Rig-404", "Producer", "2027-06-10", "2027-07-25", "Not Started", "High", 0, "Mishrif Team", "2027 Base", "#EC4899", "Facility tie-in required"),
-        ("NWD-028", "R-4405", "Nahr Umr", "South", "S-Pad-11", "Rig-404", "Appraisal", "2027-08-01", "2027-09-20", "Not Started", "Medium", 0, "Nahr Umr Team", "2027 Base", "#64748B", "Data acquisition well"),
-        ("NWD-029", "R-4406", "Main Pay", "North", "N-Pad-11", "Rig-404", "Producer", "2028-01-10", "2028-02-24", "Not Started", "High", 0, "North MP Team", "2028 Base", "#2563EB", "Long-range target"),
-        ("NWD-030", "R-4407", "Main Pay", "South", "S-Pad-12", "Rig-404", "Producer", "2029-03-05", "2029-04-18", "Not Started", "Medium", 0, "South MP Team", "2029 Base", "#2563EB", "Long-range placeholder"),
-    ]
-    df = pd.DataFrame(records, columns=REQUIRED_COLUMNS)
-    return normalize_dataframe(df)
+def create_empty_dataframe() -> pd.DataFrame:
+    """Return an empty, correctly structured NWD schedule."""
+    return normalize_dataframe(pd.DataFrame(columns=REQUIRED_COLUMNS))
 
 
 def clean_column_name(value: object) -> str:
@@ -243,11 +239,13 @@ def normalize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
                 df[col] = 0
             elif col == "Color":
                 df[col] = DEFAULT_COLOR
+            elif col == "Highlight":
+                df[col] = False
             else:
                 df[col] = ""
 
     # Keep supported columns first, then any extra user columns.
-    extra_cols = [c for c in df.columns if c not in REQUIRED_COLUMNS and c not in {"Duration_Days", "Start_Year", "End_Year"}]
+    extra_cols = [c for c in df.columns if c not in REQUIRED_COLUMNS and c not in set(COMPUTED_COLUMNS)]
     df = df[REQUIRED_COLUMNS + extra_cols]
 
     for col in DATE_COLUMNS:
@@ -257,8 +255,26 @@ def normalize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
         if col in df.columns:
             df[col] = df[col].fillna("").astype(str).str.strip()
 
-    df["Progress_Pct"] = pd.to_numeric(df["Progress_Pct"], errors="coerce").fillna(0).clip(0, 100).round(0).astype(int)
+    df["Progress_Pct"] = (
+        pd.to_numeric(df["Progress_Pct"], errors="coerce")
+        .fillna(0)
+        .clip(0, 100)
+        .round(0)
+        .astype(int)
+    )
     df["Color"] = df["Color"].apply(valid_hex_color)
+
+    truthy_values = {"true", "1", "yes", "y", "on", "highlight", "highlighted"}
+    df["Highlight"] = (
+        df["Highlight"]
+        .fillna(False)
+        .apply(
+            lambda value: value
+            if isinstance(value, (bool, np.bool_))
+            else str(value).strip().lower() in truthy_values
+        )
+        .astype(bool)
+    )
 
     # Assign IDs to blank/new rows and make duplicated IDs unique.
     existing: List[str] = []
@@ -341,65 +357,66 @@ def merge_filtered_edits(
     master_df: pd.DataFrame,
     original_filtered_df: pd.DataFrame,
     edited_df: pd.DataFrame,
+    visible_columns: Sequence[str],
 ) -> pd.DataFrame:
     """
-    Merge edits made in the filtered data editor back into the full master schedule.
+    Merge visible editor changes into the full master schedule.
 
-    Behaviour:
-    - Rows outside the active filters remain unchanged.
-    - Edited visible rows replace their original versions.
-    - Rows deleted from the editor are removed from the master schedule.
-    - Newly added editor rows are added to the master schedule.
-    - Blank or duplicated Target_ID values are corrected by normalize_dataframe().
+    Hidden columns are preserved from the original rows. Deleted visible rows are
+    removed, newly added rows are included, and rows outside active filters remain
+    untouched.
     """
     master = normalize_dataframe(master_df)
     original_visible = normalize_dataframe(original_filtered_df)
 
     if edited_df is None:
-        edited = pd.DataFrame(columns=original_visible.columns)
+        edited = pd.DataFrame(columns=[INTERNAL_ROW_KEY] + list(visible_columns))
     else:
         edited = edited_df.copy()
 
-    original_visible_ids = set(
-        original_visible["Target_ID"]
-        .fillna("")
-        .astype(str)
-        .str.strip()
-        .tolist()
+    original_ids = set(
+        original_visible["Target_ID"].fillna("").astype(str).str.strip().tolist()
     )
 
     untouched_rows = master[
-        ~master["Target_ID"]
-        .fillna("")
-        .astype(str)
-        .str.strip()
-        .isin(original_visible_ids)
+        ~master["Target_ID"].fillna("").astype(str).str.strip().isin(original_ids)
     ].copy()
 
-    edited_rows = normalize_dataframe(edited)
+    original_lookup = {
+        str(row["Target_ID"]).strip(): row.to_dict()
+        for _, row in original_visible.iterrows()
+    }
 
-    merged = pd.concat(
-        [untouched_rows, edited_rows],
-        ignore_index=True,
-        sort=False,
-    )
+    rebuilt_rows: List[Dict[str, object]] = []
+    for _, edited_row in edited.iterrows():
+        row_key = str(edited_row.get(INTERNAL_ROW_KEY, "") or "").strip()
+        if not row_key:
+            index_key = str(edited_row.name or "").strip()
+            if index_key in original_lookup:
+                row_key = index_key
+        base_row = dict(original_lookup.get(row_key, {}))
 
+        for column in visible_columns:
+            if column in edited_row.index:
+                base_row[column] = edited_row[column]
+
+        rebuilt_rows.append(base_row)
+
+    edited_rows = pd.DataFrame(rebuilt_rows)
+    merged = pd.concat([untouched_rows, edited_rows], ignore_index=True, sort=False)
     return normalize_dataframe(merged)
+
 
 def initialize_state() -> None:
     if "schedule_df" not in st.session_state:
-        if DEFAULT_EXCEL.exists():
-            try:
-                st.session_state.schedule_df = load_schedule_file(DEFAULT_EXCEL, DEFAULT_EXCEL.name)
-                st.session_state.source_name = DEFAULT_EXCEL.name
-            except Exception:
-                st.session_state.schedule_df = create_dummy_dataframe()
-                st.session_state.source_name = "Built-in dummy schedule"
-        else:
-            st.session_state.schedule_df = create_dummy_dataframe()
-            st.session_state.source_name = "Built-in dummy schedule"
+        st.session_state.schedule_df = create_empty_dataframe()
+        st.session_state.source_name = "Empty schedule"
+        st.session_state.source_file_name = ""
     st.session_state.setdefault("undo_stack", [])
     st.session_state.setdefault("filter_reset_token", 0)
+    st.session_state.setdefault("uploaded_sor_files", {})
+    st.session_state.setdefault("selected_sor_target_id", "")
+    st.session_state.setdefault("gantt_selection_token", 0)
 
 
 def select_options(df: pd.DataFrame, column: str) -> List[str]:
@@ -540,6 +557,319 @@ def category_color_map(values: Iterable[str]) -> Dict[str, str]:
     return {value: PALETTES[i % len(PALETTES)] for i, value in enumerate(unique)}
 
 
+def editable_schedule_columns(df: pd.DataFrame) -> List[str]:
+    """Return all editable input columns, including user-supplied extra columns."""
+    return [column for column in df.columns if column not in set(COMPUTED_COLUMNS)]
+
+
+def column_display_name(column: str) -> str:
+    labels = {
+        "Target_ID": "Target ID",
+        "Well_Name": "Well name",
+        "Target_Type": "Target type",
+        "Start_Date": "Start date",
+        "End_Date": "End date",
+        "Progress_Pct": "Progress %",
+        "Highlight_Label": "Highlight label",
+        "SoR_File": "SoR file",
+    }
+    return labels.get(column, column.replace("_", " "))
+
+
+def format_hover_value(value: object, column: str) -> str:
+    """Format one tooltip value without exposing columns hidden by the user."""
+    if pd.isna(value):
+        return ""
+    if column in DATE_COLUMNS:
+        parsed = pd.to_datetime(value, errors="coerce")
+        return "" if pd.isna(parsed) else parsed.strftime("%d-%b-%Y")
+    if column == "Progress_Pct":
+        try:
+            return f"{int(float(value))}%"
+        except (TypeError, ValueError):
+            return str(value)
+    if column == "Highlight":
+        return "Yes" if bool(value) else "No"
+    return html.escape(str(value))
+
+
+def build_editor_column_config(
+    all_columns: Sequence[str],
+    visible_columns: Sequence[str],
+) -> Dict[str, object]:
+    """Build a fully editable Streamlit table configuration."""
+    config: Dict[str, object] = {
+        "Target_ID": st.column_config.TextColumn(
+            "Target ID",
+            required=False,
+            width="small",
+            help="Blank or duplicate IDs are corrected automatically after Apply.",
+        ),
+        "Well_Name": st.column_config.TextColumn("Well name", required=False, width="small"),
+        "Reservoir": st.column_config.TextColumn("Reservoir", required=False, width="medium"),
+        "Area": st.column_config.TextColumn("Area", required=False, width="small"),
+        "Pad": st.column_config.TextColumn("Pad / cluster", required=False, width="small"),
+        "Rig": st.column_config.TextColumn("Rig", required=False, width="small"),
+        "Target_Type": st.column_config.TextColumn(
+            "Target type",
+            required=False,
+            width="medium",
+            help="Producer, Injector, TAR, Break, Maintenance, New Technology, or any custom item.",
+        ),
+        "Start_Date": st.column_config.DateColumn(
+            "Start date", format="DD-MMM-YYYY", required=False
+        ),
+        "End_Date": st.column_config.DateColumn(
+            "End date", format="DD-MMM-YYYY", required=False
+        ),
+        "Status": st.column_config.TextColumn("Status", required=False, width="small"),
+        "Priority": st.column_config.TextColumn("Priority", required=False, width="small"),
+        "Progress_Pct": st.column_config.NumberColumn(
+            "Progress %",
+            min_value=0,
+            max_value=100,
+            step=1,
+            format="%d%%",
+            required=False,
+            width="small",
+        ),
+        "Owner": st.column_config.TextColumn("Owner", required=False, width="medium"),
+        "Campaign": st.column_config.TextColumn("Campaign", required=False, width="medium"),
+        "Color": st.column_config.TextColumn(
+            "Hex color", required=False, width="small", help="Example: #2563EB"
+        ),
+        "Highlight": st.column_config.CheckboxColumn(
+            "Highlight",
+            default=False,
+            help="Adds a purple dashed border around the Gantt bar.",
+        ),
+        "Highlight_Label": st.column_config.TextColumn(
+            "Highlight label",
+            required=False,
+            width="medium",
+            help="Example: New Technology",
+        ),
+        "SoR_File": st.column_config.TextColumn(
+            "SoR file",
+            required=False,
+            width="large",
+            help="PDF filename stored in the configured input folder.",
+        ),
+        "Notes": st.column_config.TextColumn("Notes", required=False, width="large"),
+        INTERNAL_ROW_KEY: None,
+    }
+
+    visible_set = set(visible_columns)
+    for column in all_columns:
+        if column not in visible_set:
+            config[column] = None
+
+    return config
+
+
+def safe_filename_stem(name: str) -> str:
+    raw_stem = Path(str(name or "")).stem.strip()
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", raw_stem).strip("._-")
+    return stem or "NWD_Schedule"
+
+
+def updated_input_filename(source_name: str) -> str:
+    return f"{safe_filename_stem(source_name)}_updated.csv"
+
+
+def resolve_sor_directory(folder_text: str) -> Path:
+    folder_text = str(folder_text or "").strip()
+    if not folder_text:
+        return DEFAULT_SOR_DIR
+    candidate = Path(folder_text).expanduser()
+    return candidate if candidate.is_absolute() else APP_DIR / candidate
+
+
+def normalized_document_key(value: object) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
+
+
+def local_pdf_files(folder: Path) -> List[Path]:
+    if not folder.exists() or not folder.is_dir():
+        return []
+    try:
+        return sorted(
+            [
+                path
+                for path in folder.rglob("*")
+                if path.is_file() and path.suffix.lower() == ".pdf"
+            ],
+            key=lambda item: item.name.lower(),
+        )
+    except OSError:
+        return []
+
+
+def resolve_sor_document(
+    target_row: pd.Series,
+    sor_directory: Path,
+    uploaded_files: Dict[str, bytes],
+) -> Optional[Dict[str, object]]:
+    """
+    Resolve an SoR PDF using:
+    1. The row's SoR_File value.
+    2. Exact Target_ID or Well_Name filename matching.
+    3. Partial Target_ID or Well_Name filename matching.
+    """
+    uploaded_lookup = {
+        name.lower(): {"name": name, "bytes": content, "source": "Uploaded PDF"}
+        for name, content in uploaded_files.items()
+        if str(name).lower().endswith(".pdf")
+    }
+
+    local_files = local_pdf_files(sor_directory)
+    local_lookup = {path.name.lower(): path for path in local_files}
+
+    requested = str(target_row.get("SoR_File", "") or "").strip()
+    if requested:
+        requested_name = Path(requested).name.lower()
+        if requested_name in uploaded_lookup:
+            return uploaded_lookup[requested_name]
+
+        requested_path = Path(requested).expanduser()
+        possible_paths = []
+        if requested_path.is_absolute():
+            possible_paths.append(requested_path)
+        else:
+            possible_paths.extend(
+                [
+                    sor_directory / requested_path,
+                    APP_DIR / requested_path,
+                ]
+            )
+
+        for path in possible_paths:
+            if path.exists() and path.is_file() and path.suffix.lower() == ".pdf":
+                try:
+                    pdf_bytes = path.read_bytes()
+                except OSError:
+                    continue
+                return {
+                    "name": path.name,
+                    "bytes": pdf_bytes,
+                    "source": str(path),
+                }
+
+        if requested_name in local_lookup:
+            path = local_lookup[requested_name]
+            try:
+                pdf_bytes = path.read_bytes()
+            except OSError:
+                pdf_bytes = None
+            if pdf_bytes is not None:
+                return {
+                    "name": path.name,
+                    "bytes": pdf_bytes,
+                    "source": str(path),
+                }
+
+    target_keys = [
+        normalized_document_key(target_row.get("Target_ID", "")),
+        normalized_document_key(target_row.get("Well_Name", "")),
+    ]
+    target_keys = [key for key in target_keys if key]
+
+    candidates: List[Dict[str, object]] = list(uploaded_lookup.values())
+    for path in local_files:
+        candidates.append(
+            {
+                "name": path.name,
+                "path": path,
+                "source": str(path),
+            }
+        )
+
+    def candidate_key(candidate: Dict[str, object]) -> str:
+        return normalized_document_key(Path(str(candidate["name"])).stem)
+
+    exact_matches = [
+        candidate
+        for candidate in candidates
+        if candidate_key(candidate) in target_keys
+    ]
+    partial_matches = [
+        candidate
+        for candidate in candidates
+        if any(key in candidate_key(candidate) for key in target_keys)
+    ]
+
+    matches = exact_matches or partial_matches
+    if not matches:
+        return None
+
+    selected = sorted(matches, key=lambda item: len(str(item["name"])))[0]
+    if "bytes" not in selected:
+        selected = dict(selected)
+        try:
+            selected["bytes"] = Path(selected["path"]).read_bytes()
+        except OSError:
+            return None
+    return selected
+
+
+def extract_selected_target_id(event: object) -> str:
+    try:
+        points = event.selection.points
+    except (AttributeError, TypeError):
+        try:
+            points = event.get("selection", {}).get("points", [])
+        except AttributeError:
+            points = []
+
+    if not points:
+        return ""
+
+    customdata = points[0].get("customdata", [])
+    if isinstance(customdata, (list, tuple)) and customdata:
+        return str(customdata[0] or "").strip()
+    return ""
+
+
+def show_pdf_viewer(document: Dict[str, object], target_id: str) -> None:
+    pdf_bytes = bytes(document["bytes"])
+    file_name = str(document["name"])
+
+    info_col, download_col = st.columns([3, 1])
+    info_col.success(f"SoR found for {target_id}: {file_name}")
+    download_col.download_button(
+        "Download SoR PDF",
+        data=pdf_bytes,
+        file_name=file_name,
+        mime="application/pdf",
+        use_container_width=True,
+        key=f"download_sor_{target_id}_{normalized_document_key(file_name)}",
+    )
+
+    if hasattr(st, "pdf"):
+        try:
+            st.pdf(
+                pdf_bytes,
+                height=850,
+                key=f"sor_pdf_{target_id}_{normalized_document_key(file_name)}",
+            )
+            return
+        except Exception:
+            pass
+
+    encoded = base64.b64encode(pdf_bytes).decode("ascii")
+    components.html(
+        (
+            '<iframe '
+            f'src="data:application/pdf;base64,{encoded}" '
+            'width="100%" height="850" '
+            'style="border:1px solid rgba(128,128,128,.3);border-radius:8px;">'
+            "</iframe>"
+        ),
+        height=870,
+        scrolling=True,
+    )
+
+
 def build_gantt(
     df: pd.DataFrame,
     color_mode: str,
@@ -552,53 +882,32 @@ def build_gantt(
     show_progress: bool,
     show_horizontal_grid: bool,
     height_per_row: int,
+    tooltip_columns: Sequence[str],
 ) -> go.Figure:
-    """
-    Build an interactive Gantt chart.
-
-    Supported chart types:
-    - Detailed target rows:
-        One Y-axis row per target, matching the original application behaviour.
-    - Compact merged lanes:
-        One Y-axis row per selected column value. For example, all targets for the
-        same Rig, Pad or Reservoir are drawn on the same lane.
-    - Grouped target rows:
-        One row per target, with the selected Y-axis column shown as a prefix.
-
-    The dataframe supplied to this function is already filtered, so merged lanes
-    automatically contain only the currently visible schedule.
-    """
+    """Build the interactive and selectable NWD Gantt chart."""
     if df.empty:
         fig = go.Figure()
         fig.add_annotation(
-            text="No targets match the selected filters",
+            text="The schedule is empty. Upload a file or add a target.",
             x=0.5,
             y=0.5,
             showarrow=False,
             font={"size": 18},
         )
-        fig.update_layout(
-            height=420,
-            xaxis={"visible": False},
-            yaxis={"visible": False},
-        )
+        fig.update_layout(height=420, xaxis={"visible": False}, yaxis={"visible": False})
         return fig
 
     plot_df = df.dropna(subset=["Start_Date", "End_Date"]).copy()
     if plot_df.empty:
         fig = go.Figure()
         fig.add_annotation(
-            text="Visible targets do not have valid start and end dates",
+            text="Visible items do not have valid start and end dates.",
             x=0.5,
             y=0.5,
             showarrow=False,
             font={"size": 18},
         )
-        fig.update_layout(
-            height=420,
-            xaxis={"visible": False},
-            yaxis={"visible": False},
-        )
+        fig.update_layout(height=420, xaxis={"visible": False}, yaxis={"visible": False})
         return fig
 
     if y_axis_column not in plot_df.columns:
@@ -606,23 +915,15 @@ def build_gantt(
     if group_by not in plot_df.columns:
         group_by = "Rig"
 
-    # Keep blank grouping values visible instead of dropping them.
-    plot_df[y_axis_column] = (
-        plot_df[y_axis_column]
-        .fillna("")
-        .astype(str)
-        .str.strip()
-        .replace("", "Unassigned")
-    )
-    plot_df[group_by] = (
-        plot_df[group_by]
-        .fillna("")
-        .astype(str)
-        .str.strip()
-        .replace("", "Unassigned")
-    )
+    for column in [y_axis_column, group_by]:
+        plot_df[column] = (
+            plot_df[column]
+            .fillna("")
+            .astype(str)
+            .str.strip()
+            .replace("", "Unassigned")
+        )
 
-    # Target-label source used both on the detailed Y-axis and inside bars.
     if label_mode == "Well name":
         plot_df["Task_Label"] = plot_df["Well_Name"].fillna("").astype(str)
     elif label_mode == "Target ID + well":
@@ -646,8 +947,7 @@ def build_gantt(
         ascending=[True, True, True, True, True],
     ).reset_index(drop=True)
 
-    def make_unique_labels(values: Sequence[str]) -> List[str]:
-        """Make duplicate detailed labels unique without changing the base text."""
+    def unique_labels(values: Sequence[str]) -> List[str]:
         seen: Dict[str, int] = {}
         result: List[str] = []
         for raw_value in values:
@@ -657,27 +957,26 @@ def build_gantt(
         return result
 
     if gantt_type == "Compact merged lanes":
-        # Repeated values intentionally remain repeated: Plotly draws every target
-        # assigned to that value on one shared Y-axis lane.
         plot_df["Y_Label"] = plot_df[y_axis_column].astype(str)
         separator_field = y_axis_column
-        type_description = f"Compact lanes by {y_axis_column.replace('_', ' ')}"
+        type_description = f"Compact lanes by {column_display_name(y_axis_column)}"
     elif gantt_type == "Grouped target rows":
-        combined_labels = (
-            plot_df[y_axis_column].astype(str)
-            + "  |  "
-            + plot_df["Task_Label"].astype(str)
+        plot_df["Y_Label"] = unique_labels(
+            (
+                plot_df[y_axis_column].astype(str)
+                + "  |  "
+                + plot_df["Task_Label"].astype(str)
+            ).tolist()
         )
-        plot_df["Y_Label"] = make_unique_labels(combined_labels.tolist())
         separator_field = y_axis_column
-        type_description = f"Grouped rows by {y_axis_column.replace('_', ' ')}"
+        type_description = f"Grouped rows by {column_display_name(y_axis_column)}"
     else:
-        plot_df["Y_Label"] = make_unique_labels(plot_df["Task_Label"].tolist())
+        plot_df["Y_Label"] = unique_labels(plot_df["Task_Label"].tolist())
         separator_field = group_by
         type_description = "Detailed target rows"
 
-    # Preserve the first filtered/sorted appearance of each Y-axis category.
     y_categories = list(dict.fromkeys(plot_df["Y_Label"].astype(str).tolist()))
+    y_position = {category: index for index, category in enumerate(y_categories)}
     row_count = len(y_categories)
 
     if color_mode == "Custom row color":
@@ -692,64 +991,63 @@ def build_gantt(
         else:
             cmap = category_color_map(plot_df[field])
         colors = plot_df[field].map(cmap).fillna(DEFAULT_COLOR).tolist()
-        legend_title = field.replace("_", " ")
+        legend_title = column_display_name(field)
 
     duration_ms = (
         (plot_df["End_Date"] - plot_df["Start_Date"]).dt.total_seconds() * 1000
     ).clip(lower=86_400_000)
 
     progress_text = plot_df["Progress_Pct"].astype(int).astype(str) + "%"
-    target_name_text = (
-        plot_df["Well_Name"]
-        .fillna("")
-        .astype(str)
-        .str.strip()
-    )
-    target_name_text = target_name_text.where(
-        target_name_text.ne(""),
+    target_text = plot_df["Well_Name"].fillna("").astype(str).str.strip()
+    target_text = target_text.where(
+        target_text.ne(""),
         plot_df["Target_ID"].fillna("").astype(str),
     )
 
     if bar_text_mode == "Target name + progress %":
-        bar_text = target_name_text + "<br>" + progress_text
+        bar_text = target_text + "<br>" + progress_text
     elif bar_text_mode == "Target name only":
-        bar_text = target_name_text
+        bar_text = target_text
     elif bar_text_mode == "Progress % only":
         bar_text = progress_text
     else:
         bar_text = pd.Series([""] * len(plot_df), index=plot_df.index)
 
-    # Text is drawn in a separate final trace after progress shading, preventing
-    # the darker progress overlay from hiding the target name.
-    text_midpoint_dates = (
+    text_midpoints = (
         plot_df["Start_Date"]
         + (plot_df["End_Date"] - plot_df["Start_Date"]) / 2
     )
 
-    customdata = np.stack(
-        [
-            plot_df["Target_ID"],
-            plot_df["Well_Name"],
-            plot_df["Rig"],
-            plot_df["Pad"],
-            plot_df["Reservoir"],
-            plot_df["Area"],
-            plot_df["Status"],
-            plot_df["Priority"],
-            plot_df["Progress_Pct"],
-            plot_df["Start_Date"].dt.strftime("%d-%b-%Y"),
-            plot_df["End_Date"].dt.strftime("%d-%b-%Y"),
-            plot_df["Duration_Days"].fillna(0).astype(int),
-            plot_df["Owner"],
-            plot_df["Campaign"],
-            plot_df["Notes"],
-        ],
-        axis=-1,
-    )
+    tooltip_columns = [
+        column
+        for column in tooltip_columns
+        if column in plot_df.columns
+    ]
+
+    customdata: List[List[object]] = []
+    for _, row in plot_df.iterrows():
+        values: List[object] = [
+            str(row.get("Target_ID", "")),
+            str(row.get("Well_Name", "")),
+            str(row.get("SoR_File", "")),
+        ]
+        values.extend(
+            format_hover_value(row.get(column, ""), column)
+            for column in tooltip_columns
+        )
+        customdata.append(values)
+
+    hover_lines = []
+    for data_index, column in enumerate(tooltip_columns, start=3):
+        hover_lines.append(
+            f"<b>{html.escape(column_display_name(column))}:</b> "
+            f"%{{customdata[{data_index}]}}<br>"
+        )
+    hover_lines.append("<i>Click to open the SoR PDF</i>")
+    hovertemplate = "".join(hover_lines) + "<extra></extra>"
 
     fig = go.Figure()
 
-    # Main schedule bars.
     fig.add_trace(
         go.Bar(
             x=duration_ms,
@@ -758,37 +1056,16 @@ def build_gantt(
             orientation="h",
             marker={
                 "color": colors,
-                "line": {
-                    "width": 0.7,
-                    "color": "rgba(30,41,59,.52)",
-                },
+                "line": {"width": 0.8, "color": "rgba(30,41,59,.52)"},
             },
-            # Bar labels are added later as a dedicated top-layer text trace.
             text=None,
             customdata=customdata,
-            hovertemplate=(
-                "<b>%{customdata[0]} | %{customdata[1]}</b><br>"
-                "Rig: %{customdata[2]}<br>"
-                "Pad: %{customdata[3]}<br>"
-                "Reservoir: %{customdata[4]}<br>"
-                "Area: %{customdata[5]}<br>"
-                "Status: %{customdata[6]}<br>"
-                "Priority: %{customdata[7]}<br>"
-                "Progress: %{customdata[8]}%<br>"
-                "Start: %{customdata[9]}<br>"
-                "End: %{customdata[10]}<br>"
-                "Duration: %{customdata[11]} days<br>"
-                "Owner: %{customdata[12]}<br>"
-                "Campaign: %{customdata[13]}<br>"
-                "Notes: %{customdata[14]}"
-                "<extra></extra>"
-            ),
+            hovertemplate=hovertemplate,
             showlegend=False,
-            name="Targets",
+            name="Schedule items",
         )
     )
 
-    # Optional progress shading from target start to current planned progress.
     if show_progress:
         progress_ms = (
             duration_ms
@@ -801,36 +1078,54 @@ def build_gantt(
                 base=plot_df["Start_Date"],
                 y=plot_df["Y_Label"],
                 orientation="h",
-                marker={
-                    "color": "rgba(15,23,42,.32)",
-                    "line": {"width": 0},
-                },
-                hoverinfo="skip",
+                marker={"color": "rgba(15,23,42,.32)", "line": {"width": 0}},
+                customdata=customdata,
+                hovertemplate=hovertemplate,
                 showlegend=False,
                 name="Progress",
             )
         )
 
-    # Dedicated top-layer labels: always above both the main bar and the
-    # optional progress shading. This keeps target names visible.
     if bar_text_mode != "No text":
         fig.add_trace(
             go.Scatter(
-                x=text_midpoint_dates,
+                x=text_midpoints,
                 y=plot_df["Y_Label"],
                 mode="text",
                 text=bar_text,
                 textposition="middle center",
-                textfont={
-                    "color": "white",
-                    "size": 11,
-                    "family": "Arial, sans-serif",
-                },
-                hoverinfo="skip",
+                textfont={"color": "white", "size": 11, "family": "Arial, sans-serif"},
+                customdata=customdata,
+                hovertemplate=hovertemplate,
                 showlegend=False,
                 cliponaxis=True,
                 name="Bar labels",
             )
+        )
+
+    # Purple dashed border for highlighted items, such as New Technology.
+    highlighted = plot_df[plot_df["Highlight"].fillna(False).astype(bool)]
+    half_height = 0.42 if gantt_type == "Compact merged lanes" else 0.37
+    for _, row in highlighted.iterrows():
+        category = str(row["Y_Label"])
+        category_position = y_position.get(category)
+        if category_position is None:
+            continue
+        fig.add_shape(
+            type="rect",
+            xref="x",
+            yref="y",
+            x0=row["Start_Date"],
+            x1=row["End_Date"],
+            y0=category_position - half_height,
+            y1=category_position + half_height,
+            line={
+                "color": HIGHLIGHT_COLOR,
+                "width": 3,
+                "dash": "dash",
+            },
+            fillcolor="rgba(0,0,0,0)",
+            layer="above",
         )
 
     if show_today:
@@ -850,7 +1145,6 @@ def build_gantt(
             font={"color": "#DC2626", "size": 11},
         )
 
-    # Full horizontal row/lane grid, including top and bottom boundaries.
     if show_horizontal_grid:
         for boundary_index in range(row_count + 1):
             fig.add_hline(
@@ -861,7 +1155,6 @@ def build_gantt(
                 layer="below",
             )
 
-    # Stronger separators when the selected grouping value changes.
     sorted_groups = plot_df[separator_field].astype(str).tolist()
     if gantt_type != "Compact merged lanes":
         for row_index in range(1, len(sorted_groups)):
@@ -878,14 +1171,13 @@ def build_gantt(
         420 if gantt_type == "Compact merged lanes" else 480,
         min(1800, 150 + max(row_count, 1) * height_per_row),
     )
-    title = (
-        f"NWD Drilling Schedule — {len(plot_df)} "
-        f"target{'s' if len(plot_df) != 1 else ''}"
-    )
 
     fig.update_layout(
         title={
-            "text": title,
+            "text": (
+                f"NWD Drilling Schedule — {len(plot_df)} "
+                f"item{'s' if len(plot_df) != 1 else ''}"
+            ),
             "subtitle": {
                 "text": type_description,
                 "font": {"size": 12, "color": "#64748B"},
@@ -898,6 +1190,8 @@ def build_gantt(
         barmode="overlay",
         bargap=0.12 if gantt_type == "Compact merged lanes" else 0.24,
         hoverlabel={"align": "left"},
+        clickmode="event+select",
+        selectionrevision="nwd-v1.5",
         margin={"l": 20, "r": 25, "t": 88, "b": 25},
         uniformtext={"mode": "hide", "minsize": 8},
         xaxis={
@@ -906,39 +1200,18 @@ def build_gantt(
             "showgrid": True,
             "gridcolor": "rgba(148,163,184,.20)",
             "gridwidth": 1,
-            "rangeslider": {
-                "visible": True,
-                "thickness": 0.06,
-            },
+            "rangeslider": {"visible": True, "thickness": 0.06},
             "rangeselector": {
                 "buttons": [
-                    {
-                        "count": 3,
-                        "label": "3m",
-                        "step": "month",
-                        "stepmode": "backward",
-                    },
-                    {
-                        "count": 6,
-                        "label": "6m",
-                        "step": "month",
-                        "stepmode": "backward",
-                    },
-                    {
-                        "count": 1,
-                        "label": "1y",
-                        "step": "year",
-                        "stepmode": "backward",
-                    },
-                    {
-                        "step": "all",
-                        "label": "All",
-                    },
+                    {"count": 3, "label": "3m", "step": "month", "stepmode": "backward"},
+                    {"count": 6, "label": "6m", "step": "month", "stepmode": "backward"},
+                    {"count": 1, "label": "1y", "step": "year", "stepmode": "backward"},
+                    {"step": "all", "label": "All"},
                 ]
             },
         },
         yaxis={
-            "title": y_axis_column.replace("_", " ")
+            "title": column_display_name(y_axis_column)
             if gantt_type != "Detailed target rows"
             else "",
             "autorange": "reversed",
@@ -953,7 +1226,6 @@ def build_gantt(
         font={"family": "Arial, sans-serif"},
     )
 
-    # Lightweight categorical legend, preserving the original implementation.
     if color_mode != "Custom row color":
         field = color_mode
         categories = plot_df[field].dropna().astype(str).unique().tolist()
@@ -984,6 +1256,19 @@ def build_gantt(
                 "y": -0.14,
                 "x": 0,
             }
+        )
+
+    if not highlighted.empty:
+        fig.add_trace(
+            go.Scatter(
+                x=[None],
+                y=[None],
+                mode="lines",
+                line={"color": HIGHLIGHT_COLOR, "width": 3, "dash": "dash"},
+                name="Highlighted item",
+                hoverinfo="skip",
+                showlegend=True,
+            )
         )
 
     return fig
@@ -1051,6 +1336,16 @@ def make_csv_package(
 initialize_state()
 master_df = normalize_dataframe(st.session_state.schedule_df)
 st.session_state.schedule_df = master_df
+all_editable_columns = editable_schedule_columns(master_df)
+
+if "visible_columns_widget" not in st.session_state:
+    st.session_state.visible_columns_widget = list(all_editable_columns)
+else:
+    st.session_state.visible_columns_widget = [
+        column
+        for column in st.session_state.visible_columns_widget
+        if column in all_editable_columns
+    ]
 
 header_col, status_col = st.columns([4, 1.2])
 with header_col:
@@ -1067,28 +1362,111 @@ with status_col:
 with st.sidebar:
     st.header("Data & Controls")
 
-    uploaded = st.file_uploader("Upload schedule Excel or CSV", type=["xlsx", "xls", "xlsm", "csv"], help="For Excel, the app looks for NWD_Schedule, Schedule or Targets; otherwise it reads the first sheet. CSV is read directly.")
-    col_load, col_reset = st.columns(2)
-    if col_load.button("Load file", use_container_width=True, disabled=uploaded is None):
+    uploaded = st.file_uploader(
+        "Upload schedule Excel or CSV",
+        type=["xlsx", "xls", "xlsm", "csv"],
+        help=(
+            "For Excel, the app looks for NWD_Schedule, Schedule or Targets; "
+            "otherwise it reads the first sheet. CSV is read directly."
+        ),
+    )
+
+    col_load, col_empty = st.columns(2)
+    if col_load.button(
+        "Load file",
+        use_container_width=True,
+        disabled=uploaded is None,
+    ):
         try:
             loaded = load_schedule_file(uploaded, uploaded.name)
             set_master(loaded, add_undo=True)
             st.session_state.source_name = uploaded.name
-            st.success(f"Loaded {len(loaded)} targets")
+            st.session_state.source_file_name = uploaded.name
+            st.session_state.filter_reset_token += 1
+            st.session_state.pop("visible_columns_widget", None)
+            st.success(f"Loaded {len(loaded)} schedule items")
             st.rerun()
         except Exception as exc:
             st.error(f"Could not load the schedule file: {exc}")
 
-    if col_reset.button("Load dummy", use_container_width=True):
-        set_master(create_dummy_dataframe(), add_undo=True)
-        st.session_state.source_name = "Built-in dummy schedule"
+    if col_empty.button("New empty", use_container_width=True):
+        set_master(create_empty_dataframe(), add_undo=True)
+        st.session_state.source_name = "Empty schedule"
+        st.session_state.source_file_name = ""
+        st.session_state.selected_sor_target_id = ""
+        st.session_state.filter_reset_token += 1
+        st.session_state.pop("visible_columns_widget", None)
         st.rerun()
 
-    if st.button("↩ Undo last change", use_container_width=True, disabled=not st.session_state.undo_stack):
+    if st.button(
+        "↩ Undo last change",
+        use_container_width=True,
+        disabled=not st.session_state.undo_stack,
+    ):
         previous = st.session_state.undo_stack.pop()
         st.session_state.schedule_df = normalize_dataframe(previous)
         st.toast("Last change undone")
         st.rerun()
+
+    st.download_button(
+        "⬇ Download updated input CSV",
+        data=dataframe_to_csv_bytes(master_df),
+        file_name=updated_input_filename(
+            st.session_state.get("source_file_name", "")
+        ),
+        mime="text/csv",
+        use_container_width=True,
+        help="Downloads the complete current master schedule after all applied edits.",
+    )
+
+    with st.expander("SoR PDF settings", expanded=False):
+        sor_folder_text = st.text_input(
+            "SoR PDF folder",
+            value="input",
+            help=(
+                "Relative paths are resolved beside the Python file. "
+                "Example: input. An absolute local path also works when running locally."
+            ),
+        )
+
+        uploaded_sor_documents = st.file_uploader(
+            "Upload SoR PDFs for this session",
+            type=["pdf"],
+            accept_multiple_files=True,
+            help=(
+                "Useful on Streamlit Cloud. Uploaded PDFs remain available only "
+                "for the current app session."
+            ),
+        )
+        for pdf_file in uploaded_sor_documents:
+            st.session_state.uploaded_sor_files[pdf_file.name] = pdf_file.getvalue()
+
+        st.caption(
+            f"Session PDFs: {len(st.session_state.uploaded_sor_files)} • "
+            f"Folder: {resolve_sor_directory(sor_folder_text)}"
+        )
+
+        if st.button(
+            "Clear uploaded SoR PDFs",
+            use_container_width=True,
+            disabled=not st.session_state.uploaded_sor_files,
+        ):
+            st.session_state.uploaded_sor_files = {}
+            st.rerun()
+
+    st.divider()
+    st.subheader("Table & tooltip columns")
+    visible_editor_columns = st.multiselect(
+        "Visible columns",
+        options=all_editable_columns,
+        key="visible_columns_widget",
+        help=(
+            "A hidden table column is also removed from the Gantt mouse-over tooltip. "
+            "Hidden values remain preserved in the master schedule."
+        ),
+    )
+    if not visible_editor_columns:
+        st.warning("Select at least one column to edit the schedule table.")
 
     st.divider()
     st.subheader("Filters")
@@ -1271,10 +1649,15 @@ with tab_gantt:
         show_progress,
         show_horizontal_grid,
         height_per_row,
+        visible_editor_columns,
     )
-    st.plotly_chart(
+
+    gantt_event = st.plotly_chart(
         gantt,
         use_container_width=True,
+        key=f"nwd_gantt_{st.session_state.gantt_selection_token}",
+        on_select="rerun",
+        selection_mode="points",
         config={
             "displaylogo": False,
             "scrollZoom": True,
@@ -1285,152 +1668,156 @@ with tab_gantt:
             },
         },
     )
+
+    clicked_target_id = extract_selected_target_id(gantt_event)
+    if clicked_target_id:
+        st.session_state.selected_sor_target_id = clicked_target_id
+
     st.caption(
-        "Tip: choose Compact merged lanes to place all visible targets for the "
-        "same Rig, Pad, Reservoir or other selected column on one Y-axis lane. "
-        "Use the range slider, hover details and camera icon as before."
+        "Click a target bar, its progress section, or its text label to open the "
+        "matching SoR PDF. Hidden table columns are also hidden from mouse-over text."
     )
+
+    manual_col, clear_col = st.columns([3, 1])
+    manual_target_id = manual_col.selectbox(
+        "SoR fallback selection",
+        options=[""] + master_df["Target_ID"].astype(str).tolist(),
+        format_func=lambda value: "Select a target manually..." if value == "" else value,
+        key="manual_sor_target",
+    )
+    if manual_target_id:
+        st.session_state.selected_sor_target_id = manual_target_id
+
+    if clear_col.button(
+        "Close SoR",
+        use_container_width=True,
+        disabled=not st.session_state.selected_sor_target_id,
+    ):
+        st.session_state.selected_sor_target_id = ""
+        st.session_state.gantt_selection_token += 1
+        st.rerun()
+
+    selected_target_id = st.session_state.get("selected_sor_target_id", "")
+    if selected_target_id:
+        selected_rows = master_df[
+            master_df["Target_ID"].astype(str) == str(selected_target_id)
+        ]
+
+        if selected_rows.empty:
+            st.warning(f"Selected target {selected_target_id} is not in the current schedule.")
+        else:
+            selected_row = selected_rows.iloc[0]
+            document = resolve_sor_document(
+                selected_row,
+                resolve_sor_directory(sor_folder_text),
+                st.session_state.uploaded_sor_files,
+            )
+
+            st.markdown("---")
+            st.subheader(
+                f"SoR — {selected_row['Target_ID']} | {selected_row['Well_Name']}"
+            )
+            if document is None:
+                expected_name = str(selected_row.get("SoR_File", "") or "").strip()
+                detail = (
+                    f" Expected file: `{expected_name}`."
+                    if expected_name
+                    else ""
+                )
+                st.warning(
+                    f"SoR not found for {selected_target_id}.{detail} "
+                    "Add the PDF to the configured input folder, upload it from the "
+                    "sidebar, or populate the SoR_File column."
+                )
+            else:
+                show_pdf_viewer(document, selected_target_id)
 
 with tab_edit:
     st.subheader("Editable filtered schedule")
-    st.caption("Every visible cell is editable. Type completely new values for rig, reservoir, area, target type, status or priority; edit dates and progress; add/remove rows; then click Apply table edits.")
-
-    editor_columns = [
-        "Target_ID", "Well_Name", "Reservoir", "Area", "Pad", "Rig", "Target_Type",
-        "Start_Date", "End_Date", "Status", "Priority", "Progress_Pct", "Owner",
-        "Campaign", "Color", "Notes",
-    ]
-    table_input = filtered_df[editor_columns].copy()
-
-    edited = st.data_editor(
-        table_input,
-        key=f"schedule_editor_{st.session_state.filter_reset_token}",
-        use_container_width=True,
-        hide_index=True,
-        num_rows="dynamic",
-        height=min(720, 150 + max(len(table_input), 8) * 35),
-        column_config={
-            # All categorical columns use free-text editors so new values can be
-            # entered directly without being restricted to an existing dropdown.
-            "Target_ID": st.column_config.TextColumn(
-                "Target ID",
-                required=False,
-                width="small",
-                help="Fully editable. Blank or duplicate IDs are corrected automatically when Apply is pressed.",
-            ),
-            "Well_Name": st.column_config.TextColumn(
-                "Well name",
-                required=False,
-                width="small",
-            ),
-            "Reservoir": st.column_config.TextColumn(
-                "Reservoir",
-                required=False,
-                width="medium",
-                help="Free text: existing or completely new reservoir names are accepted.",
-            ),
-            "Area": st.column_config.TextColumn(
-                "Area",
-                required=False,
-                width="small",
-            ),
-            "Pad": st.column_config.TextColumn(
-                "Pad / cluster",
-                required=False,
-                width="small",
-            ),
-            "Rig": st.column_config.TextColumn(
-                "Rig",
-                required=False,
-                width="small",
-                help="Free text: type a new rig name directly.",
-            ),
-            "Target_Type": st.column_config.TextColumn(
-                "Target type",
-                required=False,
-                width="medium",
-                help="Free text: Producer, Injector, TAR, Break, Maintenance, or any custom activity.",
-            ),
-            "Start_Date": st.column_config.DateColumn(
-                "Start date",
-                format="DD-MMM-YYYY",
-                required=False,
-            ),
-            "End_Date": st.column_config.DateColumn(
-                "End date",
-                format="DD-MMM-YYYY",
-                required=False,
-            ),
-            "Status": st.column_config.TextColumn(
-                "Status",
-                required=False,
-                width="small",
-            ),
-            "Priority": st.column_config.TextColumn(
-                "Priority",
-                required=False,
-                width="small",
-            ),
-            "Progress_Pct": st.column_config.NumberColumn(
-                "Progress %",
-                min_value=0,
-                max_value=100,
-                step=1,
-                format="%d%%",
-                required=False,
-                width="small",
-                help="Enter any whole-number progress value from 0 to 100.",
-            ),
-            "Owner": st.column_config.TextColumn(
-                "Owner",
-                required=False,
-                width="medium",
-            ),
-            "Campaign": st.column_config.TextColumn(
-                "Campaign",
-                required=False,
-                width="medium",
-            ),
-            "Color": st.column_config.TextColumn(
-                "Hex color",
-                required=False,
-                help="Example: #2563EB",
-                width="small",
-            ),
-            "Notes": st.column_config.TextColumn(
-                "Notes",
-                required=False,
-                width="large",
-            ),
-        },
-        disabled=False,
+    st.caption(
+        "All visible cells are editable. Use the sidebar to hide columns. Hidden "
+        "columns remain preserved and are also excluded from Gantt tooltips."
     )
 
-    apply_col, download_col, local_col = st.columns([1, 1, 1])
-    if apply_col.button("✅ Apply table edits", type="primary", use_container_width=True):
+    table_input = filtered_df[all_editable_columns].copy()
+    table_input.index = filtered_df["Target_ID"].astype(str).values
+    table_input[INTERNAL_ROW_KEY] = filtered_df["Target_ID"].astype(str).values
+
+    if visible_editor_columns:
+        edited = st.data_editor(
+            table_input,
+            key=f"schedule_editor_{st.session_state.filter_reset_token}",
+            use_container_width=True,
+            hide_index=True,
+            num_rows="dynamic",
+            height=min(720, 150 + max(len(table_input), 8) * 35),
+            column_config=build_editor_column_config(
+                all_editable_columns,
+                visible_editor_columns,
+            ),
+            disabled=False,
+        )
+    else:
+        edited = table_input
+        st.info("No columns are currently visible. Select columns in the sidebar.")
+
+    apply_col, input_col, package_col, local_col = st.columns(4)
+
+    if apply_col.button(
+        "✅ Apply edits",
+        type="primary",
+        use_container_width=True,
+        disabled=not visible_editor_columns,
+    ):
         try:
-            updated = merge_filtered_edits(master_df, table_input, edited)
+            updated = merge_filtered_edits(
+                master_df,
+                filtered_df,
+                edited,
+                visible_editor_columns,
+            )
             set_master(updated, add_undo=True)
-            st.session_state.source_name = "Edited in NWD Scheduler"
-            st.success("Edits applied to the master schedule.")
+            st.session_state.source_name = "Edited in NWD Scheduler v1.5"
+            st.success("Edits applied to the complete master schedule.")
             st.rerun()
         except Exception as exc:
-            st.error(f"Could not apply edits: {exc}")
+            st.error(f"Could not apply edits: {type(exc).__name__}: {exc}")
 
-    current_export = make_csv_package(master_df, filtered_df, conflicts_df, issues_df)
-    download_col.download_button(
-        "⬇ Download CSV package",
-        data=current_export,
-        file_name=f"NWD_Scheduler_CSV_{datetime.now():%Y%m%d_%H%M}.zip",
-        mime="application/zip",
+    updated_file_name = updated_input_filename(
+        st.session_state.get("source_file_name", "")
+    )
+    input_col.download_button(
+        "⬇ Updated input",
+        data=dataframe_to_csv_bytes(master_df),
+        file_name=updated_file_name,
+        mime="text/csv",
         use_container_width=True,
-        help="Downloads master schedule, filtered view, conflict report, quality report and summary as CSV files.",
+        help="Complete master schedule with all applied edits.",
     )
 
-    if local_col.button("💾 Save master CSV", use_container_width=True, help=f"Saves to {LOCAL_SAVE_FILE}"):
+    current_export = make_csv_package(
+        master_df,
+        filtered_df,
+        conflicts_df,
+        issues_df,
+    )
+    package_col.download_button(
+        "⬇ CSV package",
+        data=current_export,
+        file_name=f"NWD_Scheduler_v1.5_{datetime.now():%Y%m%d_%H%M}.zip",
+        mime="application/zip",
+        use_container_width=True,
+    )
+
+    local_save_path = APP_DIR / updated_file_name
+    if local_col.button(
+        "💾 Save beside app",
+        use_container_width=True,
+        help=f"Saves to {local_save_path}",
+    ):
         try:
-            LOCAL_SAVE_FILE.write_bytes(dataframe_to_csv_bytes(master_df))
-            st.success(f"Saved: {LOCAL_SAVE_FILE}")
+            local_save_path.write_bytes(dataframe_to_csv_bytes(master_df))
+            st.success(f"Saved: {local_save_path}")
         except Exception as exc:
             st.error(f"Local save failed: {exc}")
 
@@ -1456,6 +1843,21 @@ with tab_actions:
             owner = a1.text_input("Owner")
             campaign = a2.text_input("Campaign", value=f"{start_date.year} Base")
             color = a1.color_picker("Bar color", value=DEFAULT_COLOR)
+            highlight = a2.checkbox(
+                "Highlight item",
+                value=False,
+                help="Adds a purple dashed border around the Gantt bar.",
+            )
+            highlight_label = a1.text_input(
+                "Highlight label",
+                value="",
+                placeholder="New Technology",
+            )
+            sor_file = a2.text_input(
+                "SoR PDF filename",
+                value="",
+                placeholder="NWD-001_SoR.pdf",
+            )
             notes = st.text_area("Notes")
             submitted = st.form_submit_button("Add target", type="primary", use_container_width=True)
 
@@ -1477,6 +1879,9 @@ with tab_actions:
                 "Owner": owner,
                 "Campaign": campaign,
                 "Color": color,
+                "Highlight": bool(highlight),
+                "Highlight_Label": highlight_label,
+                "SoR_File": sor_file,
                 "Notes": notes,
             }
             set_master(pd.concat([master_df, pd.DataFrame([new_row])], ignore_index=True), add_undo=True)
@@ -1532,6 +1937,15 @@ with tab_actions:
         bulk_rig = st.selectbox("New rig", ["— Keep current —"] + sorted(set(select_options(master_df, "Rig") + ["Unassigned"])))
         bulk_color = st.color_picker("New custom color", value=DEFAULT_COLOR)
         change_color = st.checkbox("Apply the selected color", value=False)
+        bulk_highlight = st.selectbox(
+            "Highlight border",
+            ["— Keep current —", "Set highlight", "Remove highlight"],
+        )
+        bulk_highlight_label = st.text_input(
+            "Highlight label",
+            value="",
+            placeholder="New Technology",
+        )
         if st.button("Apply attribute changes", use_container_width=True, disabled=not selected_ids):
             updated = master_df.copy()
             mask = updated["Target_ID"].isin(selected_ids)
@@ -1545,6 +1959,12 @@ with tab_actions:
                 updated.loc[mask, "Rig"] = bulk_rig
             if change_color:
                 updated.loc[mask, "Color"] = bulk_color
+            if bulk_highlight == "Set highlight":
+                updated.loc[mask, "Highlight"] = True
+                if bulk_highlight_label.strip():
+                    updated.loc[mask, "Highlight_Label"] = bulk_highlight_label.strip()
+            elif bulk_highlight == "Remove highlight":
+                updated.loc[mask, "Highlight"] = False
             set_master(updated, add_undo=True)
             st.rerun()
 
@@ -1605,34 +2025,38 @@ with tab_summary:
 with tab_help:
     st.markdown(
         """
-        ### Recommended workflow
-        1. Upload your NWD Excel/CSV file, or start with the supplied dummy workbook.
-        2. Use sidebar filters to isolate a year, reservoir, rig, status, owner or campaign.
-        3. Review the **Gantt** and hover over any bar for complete target details.
-        4. Open **Edit Schedule** to change dates, rigs, status, progress, colors and notes. Add/remove rows directly in the table and click **Apply table edits**.
-        5. Use **Bulk Actions** for mass date shifts, rig reassignment, status updates, duplication or deletion.
-        6. Check **Quality & Conflicts** before publishing the schedule.
-        7. Download the CSV package. It contains the master schedule, filtered view, conflicts, data-quality issues and summary as separate CSV files.
+        ### NWD Scheduler v1.5 workflow
+        1. The application opens with an **empty schedule**.
+        2. Upload an Excel/CSV schedule or add items manually.
+        3. Choose visible columns under **Table & tooltip columns**. Hidden table
+           columns are automatically excluded from Gantt mouse-over text.
+        4. Mark `Highlight = True` for New Technology or another special item.
+           It receives a purple dashed Gantt border.
+        5. Apply edits and download **Updated input** to preserve the complete
+           amended master schedule.
+        6. Put SoR PDFs in the `input` folder beside the Python file, upload PDFs
+           temporarily from the sidebar, and optionally populate `SoR_File`.
+        7. Click a Gantt target to open its matching SoR PDF. If no match exists,
+           the application displays **SoR not found**.
 
-        ### Minimum useful input columns
-        `Target_ID`, `Well_Name`, `Rig`, `Start_Date`, `End_Date`.
-        Missing optional columns are automatically created. Common headings such as **Well**, **Start Date**, **Spud Date**, **End Date**, **Progress %**, **Comments** and **Colour** are recognized.
+        ### SoR filename matching
+        The most reliable method is to populate `SoR_File`, for example
+        `R-1501_SoR.pdf`. If it is blank, the app searches PDF filenames using
+        `Target_ID` and `Well_Name`.
 
-        ### Gantt chart views
-        - **Detailed target rows:** preserves the original one-target-per-row chart.
-        - **Compact merged lanes:** merges visible targets onto one lane for each selected Rig, Pad, Reservoir, Area, Campaign or other Y-axis column.
-        - **Grouped target rows:** keeps individual target rows while showing the selected Y-axis grouping value on the left.
-        - **Text inside bars:** can show the Well Name plus progress, Well Name only, percentage only, or no text. Labels are drawn above progress shading so they remain visible.
-        - **Editable schedule:** all visible cells accept direct edits, including completely new Rig, Reservoir, Area, Target Type, Status and Priority values.
-        - **Horizontal grid lines:** can be switched on or off from the sidebar.
+        ### Streamlit Cloud
+        A cloud app cannot read a folder on your personal computer. For cloud use,
+        either:
+        - add permitted PDFs to the repository's `input` folder, or
+        - upload PDFs from the application's sidebar for the current session.
 
-        ### Color handling
-        Keep **Color bars by = Custom row color** to use each row's hex color. Edit the `Color` column or use **Bulk Actions → Apply the selected color**. You can also color dynamically by status, priority, rig, reservoir, area, target type or campaign.
+        Do not put confidential operational documents in a public repository.
 
-        ### Important behavior
-        Filters use date overlap logic: a target is visible when any portion of its duration overlaps the selected schedule window. Edits made in a filtered table are merged back into the complete master schedule; rows outside the filter remain untouched.
+        ### Important editing behavior
+        Filtered edits are merged into the complete master schedule. Rows outside
+        active filters and all hidden column values remain unchanged.
         """
     )
 
 st.divider()
-st.caption("NWD Scheduler • Session-based editing with undo • Download the CSV package regularly to preserve approved schedule versions")
+st.caption("NWD Scheduler v1.5 • Empty start • Highlighted technology items • Dynamic tooltips • Click-to-open SoR")
