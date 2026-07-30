@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-NWD Scheduler v1.5 - Streamlit application
+NWD Scheduler v1.5.1 - Streamlit application
 
 Run:
-    streamlit run nwd_scheduler_v1.5.py
+    streamlit run nwd_scheduler_v1.5.1.py
 
 The application opens with an empty schedule. Upload an Excel/CSV schedule
 when required. Place SoR PDF documents in an "input" folder beside this Python
@@ -594,36 +594,75 @@ def format_hover_value(value: object, column: str) -> str:
 
 
 def build_editor_column_config(
-    all_columns: Sequence[str],
     visible_columns: Sequence[str],
 ) -> Dict[str, object]:
-    """Build a fully editable Streamlit table configuration."""
-    config: Dict[str, object] = {
+    """
+    Build column configuration only for columns actually sent to st.data_editor.
+
+    Avoid configuring hidden or absent columns because Streamlit validates each
+    configured type against the dataframe schema.
+    """
+    known_config: Dict[str, object] = {
         "Target_ID": st.column_config.TextColumn(
             "Target ID",
             required=False,
             width="small",
             help="Blank or duplicate IDs are corrected automatically after Apply.",
         ),
-        "Well_Name": st.column_config.TextColumn("Well name", required=False, width="small"),
-        "Reservoir": st.column_config.TextColumn("Reservoir", required=False, width="medium"),
-        "Area": st.column_config.TextColumn("Area", required=False, width="small"),
-        "Pad": st.column_config.TextColumn("Pad / cluster", required=False, width="small"),
-        "Rig": st.column_config.TextColumn("Rig", required=False, width="small"),
+        "Well_Name": st.column_config.TextColumn(
+            "Well name",
+            required=False,
+            width="small",
+        ),
+        "Reservoir": st.column_config.TextColumn(
+            "Reservoir",
+            required=False,
+            width="medium",
+        ),
+        "Area": st.column_config.TextColumn(
+            "Area",
+            required=False,
+            width="small",
+        ),
+        "Pad": st.column_config.TextColumn(
+            "Pad / cluster",
+            required=False,
+            width="small",
+        ),
+        "Rig": st.column_config.TextColumn(
+            "Rig",
+            required=False,
+            width="small",
+        ),
         "Target_Type": st.column_config.TextColumn(
             "Target type",
             required=False,
             width="medium",
-            help="Producer, Injector, TAR, Break, Maintenance, New Technology, or any custom item.",
+            help=(
+                "Producer, Injector, TAR, Break, Maintenance, "
+                "New Technology, or any custom item."
+            ),
         ),
         "Start_Date": st.column_config.DateColumn(
-            "Start date", format="DD-MMM-YYYY", required=False
+            "Start date",
+            format="DD-MMM-YYYY",
+            required=False,
         ),
         "End_Date": st.column_config.DateColumn(
-            "End date", format="DD-MMM-YYYY", required=False
+            "End date",
+            format="DD-MMM-YYYY",
+            required=False,
         ),
-        "Status": st.column_config.TextColumn("Status", required=False, width="small"),
-        "Priority": st.column_config.TextColumn("Priority", required=False, width="small"),
+        "Status": st.column_config.TextColumn(
+            "Status",
+            required=False,
+            width="small",
+        ),
+        "Priority": st.column_config.TextColumn(
+            "Priority",
+            required=False,
+            width="small",
+        ),
         "Progress_Pct": st.column_config.NumberColumn(
             "Progress %",
             min_value=0,
@@ -633,10 +672,21 @@ def build_editor_column_config(
             required=False,
             width="small",
         ),
-        "Owner": st.column_config.TextColumn("Owner", required=False, width="medium"),
-        "Campaign": st.column_config.TextColumn("Campaign", required=False, width="medium"),
+        "Owner": st.column_config.TextColumn(
+            "Owner",
+            required=False,
+            width="medium",
+        ),
+        "Campaign": st.column_config.TextColumn(
+            "Campaign",
+            required=False,
+            width="medium",
+        ),
         "Color": st.column_config.TextColumn(
-            "Hex color", required=False, width="small", help="Example: #2563EB"
+            "Hex color",
+            required=False,
+            width="small",
+            help="Example: #2563EB",
         ),
         "Highlight": st.column_config.CheckboxColumn(
             "Highlight",
@@ -655,16 +705,73 @@ def build_editor_column_config(
             width="large",
             help="PDF filename stored in the configured input folder.",
         ),
-        "Notes": st.column_config.TextColumn("Notes", required=False, width="large"),
-        INTERNAL_ROW_KEY: None,
+        "Notes": st.column_config.TextColumn(
+            "Notes",
+            required=False,
+            width="large",
+        ),
     }
 
-    visible_set = set(visible_columns)
-    for column in all_columns:
-        if column not in visible_set:
-            config[column] = None
-
+    config = {
+        column: known_config[column]
+        for column in visible_columns
+        if column in known_config
+    }
+    config[INTERNAL_ROW_KEY] = None
     return config
+
+
+def prepare_editor_dataframe(
+    filtered_df: pd.DataFrame,
+    visible_columns: Sequence[str],
+) -> pd.DataFrame:
+    """
+    Create a Streamlit-safe editor dataframe.
+
+    Only visible columns are passed to the widget. Hidden columns are preserved
+    separately in the master dataframe and merged back after Apply.
+    """
+    editor_df = filtered_df[list(visible_columns)].copy()
+
+    # Explicit dtypes prevent Streamlit from inferring incompatible schemas,
+    # especially when the uploaded file contains mixed or blank values.
+    for column in editor_df.columns:
+        if column in DATE_COLUMNS:
+            editor_df[column] = pd.to_datetime(
+                editor_df[column],
+                errors="coerce",
+            )
+        elif column == "Progress_Pct":
+            editor_df[column] = (
+                pd.to_numeric(editor_df[column], errors="coerce")
+                .fillna(0)
+                .clip(0, 100)
+                .round(0)
+                .astype("int64")
+            )
+        elif column == "Highlight":
+            editor_df[column] = (
+                editor_df[column]
+                .fillna(False)
+                .astype(bool)
+            )
+        elif column in TEXT_COLUMNS:
+            editor_df[column] = (
+                editor_df[column]
+                .fillna("")
+                .astype(str)
+            )
+
+    editor_df[INTERNAL_ROW_KEY] = (
+        filtered_df["Target_ID"]
+        .fillna("")
+        .astype(str)
+        .to_numpy()
+    )
+
+    # A RangeIndex avoids the empty/custom-index issue in dynamic data editors.
+    editor_df.index = pd.RangeIndex(start=0, stop=len(editor_df), step=1)
+    return editor_df
 
 
 def safe_filename_stem(name: str) -> str:
@@ -1191,7 +1298,7 @@ def build_gantt(
         bargap=0.12 if gantt_type == "Compact merged lanes" else 0.24,
         hoverlabel={"align": "left"},
         clickmode="event+select",
-        selectionrevision="nwd-v1.5",
+        selectionrevision="nwd-v1.5.1",
         margin={"l": 20, "r": 25, "t": 88, "b": 25},
         uniformtext={"mode": "hide", "minsize": 8},
         xaxis={
@@ -1275,10 +1382,14 @@ def build_gantt(
 
 
 def dataframe_to_csv_bytes(df: pd.DataFrame) -> bytes:
-    """Return a normalized dataframe as UTF-8-SIG CSV bytes for Excel compatibility."""
+    """Return a normalized dataframe as UTF-8-SIG CSV bytes."""
     export_df = normalize_dataframe(df).copy()
-    for col in DATE_COLUMNS:
-        export_df[col] = pd.to_datetime(export_df[col], errors="coerce").dt.strftime("%Y-%m-%d").fillna("")
+    for column in DATE_COLUMNS:
+        export_df[column] = (
+            pd.to_datetime(export_df[column], errors="coerce")
+            .dt.strftime("%Y-%m-%d")
+            .fillna("")
+        )
     return export_df.to_csv(index=False).encode("utf-8-sig")
 
 
@@ -1735,39 +1846,105 @@ with tab_gantt:
 with tab_edit:
     st.subheader("Editable filtered schedule")
     st.caption(
-        "All visible cells are editable. Use the sidebar to hide columns. Hidden "
-        "columns remain preserved and are also excluded from Gantt tooltips."
+        "All visible cells are editable. Hidden columns remain preserved and "
+        "are also excluded from Gantt tooltips."
     )
 
-    table_input = filtered_df[all_editable_columns].copy()
-    table_input.index = filtered_df["Target_ID"].astype(str).values
-    table_input[INTERNAL_ROW_KEY] = filtered_df["Target_ID"].astype(str).values
-
-    if visible_editor_columns:
-        edited = st.data_editor(
-            table_input,
-            key=f"schedule_editor_{st.session_state.filter_reset_token}",
-            use_container_width=True,
-            hide_index=True,
-            num_rows="dynamic",
-            height=min(720, 150 + max(len(table_input), 8) * 35),
-            column_config=build_editor_column_config(
-                all_editable_columns,
-                visible_editor_columns,
-            ),
-            disabled=False,
+    if master_df.empty:
+        st.info(
+            "The schedule is currently empty. Upload an Excel/CSV file from the "
+            "sidebar, add a target from Bulk Actions, or create the first blank row."
         )
+
+        first_row_col, template_col = st.columns([1, 1])
+
+        if first_row_col.button(
+            "➕ Create first blank row",
+            type="primary",
+            use_container_width=True,
+        ):
+            first_row = {
+                "Target_ID": "",
+                "Well_Name": "",
+                "Reservoir": "",
+                "Area": "",
+                "Pad": "",
+                "Rig": "",
+                "Target_Type": "",
+                "Start_Date": pd.NaT,
+                "End_Date": pd.NaT,
+                "Status": "",
+                "Priority": "",
+                "Progress_Pct": 0,
+                "Owner": "",
+                "Campaign": "",
+                "Color": DEFAULT_COLOR,
+                "Highlight": False,
+                "Highlight_Label": "",
+                "SoR_File": "",
+                "Notes": "",
+            }
+            set_master(pd.DataFrame([first_row]), add_undo=True)
+            st.session_state.source_name = "New schedule"
+            st.rerun()
+
+        template_col.download_button(
+            "⬇ Download empty template",
+            data=dataframe_to_csv_bytes(create_empty_dataframe()),
+            file_name="NWD_Schedule_Empty_Template.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+
+        edited = pd.DataFrame()
+    elif not visible_editor_columns:
+        st.info(
+            "No columns are currently visible. Select at least one column under "
+            "Table & tooltip columns in the sidebar."
+        )
+        edited = pd.DataFrame()
     else:
-        edited = table_input
-        st.info("No columns are currently visible. Select columns in the sidebar.")
+        table_input = prepare_editor_dataframe(
+            filtered_df,
+            visible_editor_columns,
+        )
+
+        if table_input.empty:
+            st.info(
+                "The master schedule contains data, but no rows match the current "
+                "filters. Clear or change the filters to edit rows."
+            )
+            edited = table_input
+        else:
+            edited = st.data_editor(
+                table_input,
+                key=f"schedule_editor_{st.session_state.filter_reset_token}",
+                use_container_width=True,
+                hide_index=True,
+                num_rows="dynamic",
+                height=min(
+                    720,
+                    150 + max(len(table_input), 8) * 35,
+                ),
+                column_config=build_editor_column_config(
+                    visible_editor_columns,
+                ),
+                disabled=False,
+            )
 
     apply_col, input_col, package_col, local_col = st.columns(4)
+
+    can_apply = (
+        not master_df.empty
+        and bool(visible_editor_columns)
+        and not filtered_df.empty
+    )
 
     if apply_col.button(
         "✅ Apply edits",
         type="primary",
         use_container_width=True,
-        disabled=not visible_editor_columns,
+        disabled=not can_apply,
     ):
         try:
             updated = merge_filtered_edits(
@@ -1777,11 +1954,13 @@ with tab_edit:
                 visible_editor_columns,
             )
             set_master(updated, add_undo=True)
-            st.session_state.source_name = "Edited in NWD Scheduler v1.5"
+            st.session_state.source_name = "Edited in NWD Scheduler v1.5.1"
             st.success("Edits applied to the complete master schedule.")
             st.rerun()
         except Exception as exc:
-            st.error(f"Could not apply edits: {type(exc).__name__}: {exc}")
+            st.error(
+                f"Could not apply edits: {type(exc).__name__}: {exc}"
+            )
 
     updated_file_name = updated_input_filename(
         st.session_state.get("source_file_name", "")
@@ -1804,7 +1983,10 @@ with tab_edit:
     package_col.download_button(
         "⬇ CSV package",
         data=current_export,
-        file_name=f"NWD_Scheduler_v1.5_{datetime.now():%Y%m%d_%H%M}.zip",
+        file_name=(
+            f"NWD_Scheduler_v1.5.1_"
+            f"{datetime.now():%Y%m%d_%H%M}.zip"
+        ),
         mime="application/zip",
         use_container_width=True,
     )
@@ -1816,7 +1998,9 @@ with tab_edit:
         help=f"Saves to {local_save_path}",
     ):
         try:
-            local_save_path.write_bytes(dataframe_to_csv_bytes(master_df))
+            local_save_path.write_bytes(
+                dataframe_to_csv_bytes(master_df)
+            )
             st.success(f"Saved: {local_save_path}")
         except Exception as exc:
             st.error(f"Local save failed: {exc}")
@@ -2025,7 +2209,7 @@ with tab_summary:
 with tab_help:
     st.markdown(
         """
-        ### NWD Scheduler v1.5 workflow
+        ### NWD Scheduler v1.5.1 workflow
         1. The application opens with an **empty schedule**.
         2. Upload an Excel/CSV schedule or add items manually.
         3. Choose visible columns under **Table & tooltip columns**. Hidden table
@@ -2059,4 +2243,4 @@ with tab_help:
     )
 
 st.divider()
-st.caption("NWD Scheduler v1.5 • Empty start • Highlighted technology items • Dynamic tooltips • Click-to-open SoR")
+st.caption("NWD Scheduler v1.5.1 • Empty start • Highlighted technology items • Dynamic tooltips • Click-to-open SoR")
