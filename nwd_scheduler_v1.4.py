@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-NWD Scheduler v1.5.1 - Streamlit application
+NWD Scheduler v1.6.1.1 - Streamlit application
 
 Run:
-    streamlit run nwd_scheduler_v1.5.1.py
+    streamlit run nwd_scheduler_v1.6.1.py
 
 The application opens with an empty schedule. Upload an Excel/CSV schedule
 when required. Place SoR PDF documents in an "input" folder beside this Python
@@ -15,12 +15,14 @@ Outputs are CSV-based.
 from __future__ import annotations
 
 import base64
+import gzip
 import html
 import io
 import json
 import math
 import re
 import zipfile
+import uuid
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -48,6 +50,8 @@ DEFAULT_SOR_DIR = APP_DIR / "input"
 COMPUTED_COLUMNS = ["Duration_Days", "Start_Year", "End_Year"]
 INTERNAL_ROW_KEY = "__Original_Target_ID"
 HIGHLIGHT_COLOR = "#7C3AED"
+SCHEDULE_STATE_DIR = Path.home() / ".nwd_scheduler_state"
+SCHEDULE_SNAPSHOT_PATTERN = re.compile(r"^[a-f0-9]{32}$")
 
 REQUIRED_COLUMNS = [
     "Target_ID",
@@ -186,6 +190,15 @@ st.markdown(
           border-radius: 12px;
           padding: 0.8rem 1rem;
           margin-bottom: 0.75rem;
+      }
+
+      /* Make Gantt bars visibly clickable for SoR opening. */
+      [data-testid="stPlotlyChart"] .plotly .barlayer path,
+      [data-testid="stPlotlyChart"] .plotly .scatterlayer text,
+      [data-testid="stPlotlyChart"] .plotly .scatterlayer .point,
+      [data-testid="stPlotlyChart"] .plotly .nsewdrag,
+      [data-testid="stPlotlyChart"] .plotly .cursor-crosshair {
+          cursor: pointer !important;
       }
     </style>
     """,
@@ -409,14 +422,401 @@ def merge_filtered_edits(
 
 def initialize_state() -> None:
     if "schedule_df" not in st.session_state:
-        st.session_state.schedule_df = create_empty_dataframe()
-        st.session_state.source_name = "Empty schedule"
-        st.session_state.source_file_name = ""
+        persisted_settings = read_persisted_view_settings()
+        restored_df, restored_source_name = load_schedule_snapshot(
+            persisted_settings.get("schedule_snapshot_id", "")
+        )
+
+        if restored_df is not None and not restored_df.empty:
+            st.session_state.schedule_df = restored_df
+            st.session_state.source_file_name = str(
+                persisted_settings.get(
+                    "source_file_name",
+                    restored_source_name,
+                )
+                or restored_source_name
+                or ""
+            )
+            st.session_state.source_name = (
+                st.session_state.source_file_name
+                or "Restored schedule"
+            )
+            st.session_state.schedule_snapshot_id = valid_schedule_snapshot_id(
+                persisted_settings.get("schedule_snapshot_id", "")
+            )
+        else:
+            st.session_state.schedule_df = create_empty_dataframe()
+            st.session_state.source_name = "Empty schedule"
+            st.session_state.source_file_name = ""
+            st.session_state.schedule_snapshot_id = ""
+
     st.session_state.setdefault("undo_stack", [])
     st.session_state.setdefault("filter_reset_token", 0)
     st.session_state.setdefault("uploaded_sor_files", {})
     st.session_state.setdefault("selected_sor_target_id", "")
     st.session_state.setdefault("gantt_selection_token", 0)
+    st.session_state.setdefault("schedule_snapshot_id", "")
+
+
+
+VIEW_QUERY_PARAM = "nwd_view"
+
+
+def valid_schedule_snapshot_id(value: object) -> str:
+    snapshot_id = str(value or "").strip().lower()
+    return snapshot_id if SCHEDULE_SNAPSHOT_PATTERN.fullmatch(snapshot_id) else ""
+
+
+def schedule_snapshot_path(snapshot_id: str) -> Path:
+    return SCHEDULE_STATE_DIR / f"{snapshot_id}.csv"
+
+
+def save_schedule_snapshot(
+    df: pd.DataFrame,
+    source_file_name: str,
+    existing_snapshot_id: str = "",
+) -> str:
+    """
+    Save the current master schedule on the app server.
+
+    The URL stores only a random snapshot identifier, not the schedule contents.
+    This allows browser refresh to restore the current schedule during the
+    lifetime of the Streamlit deployment/container.
+    """
+    normalized = normalize_dataframe(df)
+    if normalized.empty:
+        return ""
+
+    snapshot_id = valid_schedule_snapshot_id(existing_snapshot_id)
+    if not snapshot_id:
+        snapshot_id = uuid.uuid4().hex
+
+    try:
+        SCHEDULE_STATE_DIR.mkdir(parents=True, exist_ok=True)
+        schedule_snapshot_path(snapshot_id).write_bytes(
+            dataframe_to_csv_bytes(normalized)
+        )
+
+        metadata = {
+            "source_file_name": str(source_file_name or ""),
+            "saved_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        (SCHEDULE_STATE_DIR / f"{snapshot_id}.json").write_text(
+            json.dumps(metadata, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return snapshot_id
+    except OSError:
+        return ""
+
+
+def load_schedule_snapshot(
+    snapshot_id: object,
+) -> Tuple[Optional[pd.DataFrame], str]:
+    """Load a previously persisted schedule snapshot."""
+    valid_id = valid_schedule_snapshot_id(snapshot_id)
+    if not valid_id:
+        return None, ""
+
+    csv_path = schedule_snapshot_path(valid_id)
+    if not csv_path.exists():
+        return None, ""
+
+    try:
+        restored = load_schedule_file(csv_path, csv_path.name)
+        source_file_name = ""
+        metadata_path = SCHEDULE_STATE_DIR / f"{valid_id}.json"
+        if metadata_path.exists():
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            source_file_name = str(metadata.get("source_file_name", "") or "")
+        return restored, source_file_name
+    except Exception:
+        return None, ""
+
+
+def embedded_schedule_payload(
+    df: pd.DataFrame,
+) -> Dict[str, object]:
+    """
+    Compress the complete schedule into a portable JSON-template payload.
+
+    A browser cannot silently reopen a local CSV path after refresh, so the
+    template stores the actual CSV data instead of an inaccessible local link.
+    """
+    normalized = normalize_dataframe(df)
+    csv_bytes = dataframe_to_csv_bytes(normalized)
+    compressed = gzip.compress(csv_bytes, compresslevel=9)
+    return {
+        "encoding": "gzip+base64",
+        "row_count": int(len(normalized)),
+        "data": base64.b64encode(compressed).decode("ascii"),
+    }
+
+
+def dataframe_from_embedded_payload(
+    payload: object,
+) -> Optional[pd.DataFrame]:
+    """Restore a schedule dataframe embedded in a JSON view template."""
+    if not isinstance(payload, dict):
+        return None
+
+    if payload.get("encoding") != "gzip+base64":
+        return None
+
+    encoded = str(payload.get("data", "") or "")
+    if not encoded:
+        return None
+
+    try:
+        compressed = base64.b64decode(encoded)
+        csv_bytes = gzip.decompress(compressed)
+        return load_schedule_file(
+            io.BytesIO(csv_bytes),
+            "template_schedule.csv",
+        )
+    except Exception as exc:
+        raise ValueError(
+            f"Could not restore the schedule embedded in the template: {exc}"
+        ) from exc
+
+
+VIEW_WIDGET_KEYS = [
+    "visible_columns_widget",
+    "sor_folder_widget",
+    "gantt_type_widget",
+    "y_axis_column_widget",
+    "color_mode_widget",
+    "group_by_widget",
+    "label_mode_widget",
+    "bar_text_mode_widget",
+    "show_today_widget",
+    "show_progress_widget",
+    "show_horizontal_grid_widget",
+    "height_per_row_widget",
+]
+
+
+def encode_view_settings(settings: Dict[str, object]) -> str:
+    """Encode view settings into a compact URL-safe string."""
+    payload = json.dumps(
+        settings,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+
+
+def decode_view_settings(encoded: object) -> Dict[str, object]:
+    """Decode URL or template settings safely."""
+    value = str(encoded or "").strip()
+    if not value:
+        return {}
+
+    try:
+        padding = "=" * (-len(value) % 4)
+        decoded = base64.urlsafe_b64decode(value + padding).decode("utf-8")
+        result = json.loads(decoded)
+        return result if isinstance(result, dict) else {}
+    except Exception:
+        return {}
+
+
+def read_persisted_view_settings() -> Dict[str, object]:
+    """Read the saved view from the page URL after a browser refresh."""
+    try:
+        encoded = st.query_params.get(VIEW_QUERY_PARAM, "")
+    except Exception:
+        return {}
+    return decode_view_settings(encoded)
+
+
+def write_persisted_view_settings(settings: Dict[str, object]) -> None:
+    """Persist current settings in the URL so they survive page refresh."""
+    encoded = encode_view_settings(settings)
+    try:
+        current = str(st.query_params.get(VIEW_QUERY_PARAM, "") or "")
+        if current != encoded:
+            st.query_params[VIEW_QUERY_PARAM] = encoded
+    except Exception:
+        # The app still works if query-parameter persistence is unavailable.
+        pass
+
+
+def clear_persisted_view_settings() -> None:
+    """Remove the saved view from the URL."""
+    try:
+        if VIEW_QUERY_PARAM in st.query_params:
+            del st.query_params[VIEW_QUERY_PARAM]
+    except Exception:
+        try:
+            st.query_params.clear()
+        except Exception:
+            pass
+
+
+def clear_view_widget_state() -> None:
+    """Clear stable widget state before loading a template or resetting defaults."""
+    for key in VIEW_WIDGET_KEYS:
+        st.session_state.pop(key, None)
+
+
+def safe_setting_list(
+    settings: Dict[str, object],
+    key: str,
+    allowed_values: Sequence[str],
+) -> List[str]:
+    """Return saved multiselect values that still exist in the current dataset."""
+    raw = settings.get(key, [])
+    if not isinstance(raw, list):
+        return []
+    allowed = set(str(value) for value in allowed_values)
+    return [str(value) for value in raw if str(value) in allowed]
+
+
+def safe_select_index(
+    options: Sequence[str],
+    saved_value: object,
+    default_index: int = 0,
+) -> int:
+    """Return a safe selectbox index."""
+    try:
+        return list(options).index(str(saved_value))
+    except ValueError:
+        return default_index
+
+
+def safe_bool(settings: Dict[str, object], key: str, default: bool) -> bool:
+    value = settings.get(key, default)
+    return value if isinstance(value, bool) else default
+
+
+def parse_saved_date(value: object) -> Optional[date]:
+    try:
+        parsed = pd.to_datetime(value, errors="coerce")
+        return None if pd.isna(parsed) else parsed.date()
+    except Exception:
+        return None
+
+
+def create_view_settings(
+    *,
+    visible_columns: Sequence[str],
+    search: str,
+    reservoirs: Sequence[str],
+    areas: Sequence[str],
+    rigs: Sequence[str],
+    statuses: Sequence[str],
+    priorities: Sequence[str],
+    target_types: Sequence[str],
+    campaigns: Sequence[str],
+    owners: Sequence[str],
+    include_cancelled: bool,
+    date_window: Tuple[date, date],
+    sor_folder_text: str,
+    gantt_type: str,
+    y_axis_column: str,
+    color_mode: str,
+    group_by: str,
+    label_mode: str,
+    bar_text_mode: str,
+    show_today: bool,
+    show_progress: bool,
+    show_horizontal_grid: bool,
+    height_per_row: int,
+    source_file_name: str,
+    schedule_snapshot_id: str,
+) -> Dict[str, object]:
+    """Build the complete reusable sidebar/filter template."""
+    return {
+        "template_version": 1,
+        "visible_columns": list(visible_columns),
+        "search": str(search),
+        "reservoirs": list(reservoirs),
+        "areas": list(areas),
+        "rigs": list(rigs),
+        "statuses": list(statuses),
+        "priorities": list(priorities),
+        "target_types": list(target_types),
+        "campaigns": list(campaigns),
+        "owners": list(owners),
+        "include_cancelled": bool(include_cancelled),
+        "date_window": [
+            date_window[0].isoformat(),
+            date_window[1].isoformat(),
+        ],
+        "sor_folder": str(sor_folder_text),
+        "gantt_type": str(gantt_type),
+        "y_axis_column": str(y_axis_column),
+        "color_mode": str(color_mode),
+        "group_by": str(group_by),
+        "label_mode": str(label_mode),
+        "bar_text_mode": str(bar_text_mode),
+        "show_today": bool(show_today),
+        "show_progress": bool(show_progress),
+        "show_horizontal_grid": bool(show_horizontal_grid),
+        "height_per_row": int(height_per_row),
+        "source_file_name": str(source_file_name or ""),
+        "schedule_snapshot_id": valid_schedule_snapshot_id(
+            schedule_snapshot_id
+        ),
+    }
+
+
+def view_template_bytes(
+    settings: Dict[str, object],
+    template_name: str,
+    schedule_df: pd.DataFrame,
+    source_file_name: str,
+) -> bytes:
+    """
+    Create a portable JSON template containing:
+    - current filters and chart settings;
+    - original input filename;
+    - the complete current schedule as compressed CSV data.
+    """
+    payload = {
+        "template_name": str(template_name or "NWD View"),
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "source_file_name": str(source_file_name or ""),
+        "settings": settings,
+        "schedule": embedded_schedule_payload(schedule_df),
+    }
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        indent=2,
+    ).encode("utf-8")
+
+
+def read_uploaded_view_template(
+    uploaded_file: object,
+) -> Tuple[Dict[str, object], Optional[pd.DataFrame], str]:
+    """Read settings and the optional embedded schedule from a JSON template."""
+    if uploaded_file is None:
+        return {}, None, ""
+
+    raw = uploaded_file.getvalue().decode("utf-8-sig")
+    payload = json.loads(raw)
+    if not isinstance(payload, dict):
+        raise ValueError("The template JSON must contain an object.")
+
+    settings = payload.get("settings", payload)
+    if not isinstance(settings, dict):
+        raise ValueError("The template does not contain valid settings.")
+
+    restored_schedule = dataframe_from_embedded_payload(
+        payload.get("schedule")
+    )
+    source_file_name = str(
+        payload.get(
+            "source_file_name",
+            settings.get("source_file_name", ""),
+        )
+        or ""
+    )
+
+    return settings, restored_schedule, source_file_name
 
 
 def select_options(df: pd.DataFrame, column: str) -> List[str]:
@@ -1298,8 +1698,8 @@ def build_gantt(
         bargap=0.12 if gantt_type == "Compact merged lanes" else 0.24,
         hoverlabel={"align": "left"},
         clickmode="event+select",
-        selectionrevision="nwd-v1.5.1",
-        margin={"l": 20, "r": 25, "t": 88, "b": 25},
+        selectionrevision="nwd-v1.6.1",
+        margin={"l": 20, "r": 25, "t": 88, "b": 10},
         uniformtext={"mode": "hide", "minsize": 8},
         xaxis={
             "title": "Calendar date",
@@ -1307,7 +1707,7 @@ def build_gantt(
             "showgrid": True,
             "gridcolor": "rgba(148,163,184,.20)",
             "gridwidth": 1,
-            "rangeslider": {"visible": True, "thickness": 0.06},
+            "rangeslider": {"visible": False},
             "rangeselector": {
                 "buttons": [
                     {"count": 3, "label": "3m", "step": "month", "stepmode": "backward"},
@@ -1447,10 +1847,34 @@ def make_csv_package(
 initialize_state()
 master_df = normalize_dataframe(st.session_state.schedule_df)
 st.session_state.schedule_df = master_df
+
+if master_df.empty:
+    st.session_state.schedule_snapshot_id = ""
+else:
+    current_snapshot_id = save_schedule_snapshot(
+        master_df,
+        st.session_state.get("source_file_name", ""),
+        st.session_state.get("schedule_snapshot_id", ""),
+    )
+    if current_snapshot_id:
+        st.session_state.schedule_snapshot_id = current_snapshot_id
+
 all_editable_columns = editable_schedule_columns(master_df)
+persisted_view_settings = read_persisted_view_settings()
 
 if "visible_columns_widget" not in st.session_state:
-    st.session_state.visible_columns_widget = list(all_editable_columns)
+    saved_visible_columns = persisted_view_settings.get(
+        "visible_columns",
+        list(all_editable_columns),
+    )
+    if not isinstance(saved_visible_columns, list):
+        saved_visible_columns = list(all_editable_columns)
+
+    st.session_state.visible_columns_widget = [
+        column
+        for column in saved_visible_columns
+        if column in all_editable_columns
+    ] or list(all_editable_columns)
 else:
     st.session_state.visible_columns_widget = [
         column
@@ -1493,6 +1917,10 @@ with st.sidebar:
             set_master(loaded, add_undo=True)
             st.session_state.source_name = uploaded.name
             st.session_state.source_file_name = uploaded.name
+            st.session_state.schedule_snapshot_id = save_schedule_snapshot(
+                loaded,
+                uploaded.name,
+            )
             st.session_state.filter_reset_token += 1
             st.session_state.pop("visible_columns_widget", None)
             st.success(f"Loaded {len(loaded)} schedule items")
@@ -1504,6 +1932,7 @@ with st.sidebar:
         set_master(create_empty_dataframe(), add_undo=True)
         st.session_state.source_name = "Empty schedule"
         st.session_state.source_file_name = ""
+        st.session_state.schedule_snapshot_id = ""
         st.session_state.selected_sor_target_id = ""
         st.session_state.filter_reset_token += 1
         st.session_state.pop("visible_columns_widget", None)
@@ -1533,7 +1962,8 @@ with st.sidebar:
     with st.expander("SoR PDF settings", expanded=False):
         sor_folder_text = st.text_input(
             "SoR PDF folder",
-            value="input",
+            value=str(persisted_view_settings.get("sor_folder", "input")),
+            key="sor_folder_widget",
             help=(
                 "Relative paths are resolved beside the Python file. "
                 "Example: input. An absolute local path also works when running locally."
@@ -1583,130 +2013,492 @@ with st.sidebar:
     st.subheader("Filters")
     reset_token = st.session_state.filter_reset_token
 
-    search = st.text_input("Search all fields", key=f"search_{reset_token}", placeholder="Well, target, owner, note...")
-    reservoirs = st.multiselect("Reservoir", select_options(master_df, "Reservoir"), key=f"reservoir_{reset_token}")
-    areas = st.multiselect("Area", select_options(master_df, "Area"), key=f"area_{reset_token}")
-    rigs = st.multiselect("Rig", select_options(master_df, "Rig"), key=f"rig_{reset_token}")
-    statuses = st.multiselect("Status", select_options(master_df, "Status"), key=f"status_{reset_token}")
-    priorities = st.multiselect("Priority", select_options(master_df, "Priority"), key=f"priority_{reset_token}")
-    target_types = st.multiselect("Target type", select_options(master_df, "Target_Type"), key=f"type_{reset_token}")
-    campaigns = st.multiselect("Campaign", select_options(master_df, "Campaign"), key=f"campaign_{reset_token}")
-    owners = st.multiselect("Owner", select_options(master_df, "Owner"), key=f"owner_{reset_token}")
-    include_cancelled = st.checkbox("Include cancelled targets", value=False, key=f"cancelled_{reset_token}")
+    reservoir_options = select_options(master_df, "Reservoir")
+    area_options = select_options(master_df, "Area")
+    rig_options = select_options(master_df, "Rig")
+    status_options = select_options(master_df, "Status")
+    priority_options = select_options(master_df, "Priority")
+    target_type_options = select_options(master_df, "Target_Type")
+    campaign_options = select_options(master_df, "Campaign")
+    owner_options = select_options(master_df, "Owner")
 
-    valid_dates = pd.concat([master_df["Start_Date"], master_df["End_Date"]]).dropna()
+    search = st.text_input(
+        "Search all fields",
+        value=str(persisted_view_settings.get("search", "")),
+        key=f"search_{reset_token}",
+        placeholder="Well, target, owner, note...",
+    )
+    reservoirs = st.multiselect(
+        "Reservoir",
+        reservoir_options,
+        default=safe_setting_list(
+            persisted_view_settings,
+            "reservoirs",
+            reservoir_options,
+        ),
+        key=f"reservoir_{reset_token}",
+    )
+    areas = st.multiselect(
+        "Area",
+        area_options,
+        default=safe_setting_list(
+            persisted_view_settings,
+            "areas",
+            area_options,
+        ),
+        key=f"area_{reset_token}",
+    )
+    rigs = st.multiselect(
+        "Rig",
+        rig_options,
+        default=safe_setting_list(
+            persisted_view_settings,
+            "rigs",
+            rig_options,
+        ),
+        key=f"rig_{reset_token}",
+    )
+    statuses = st.multiselect(
+        "Status",
+        status_options,
+        default=safe_setting_list(
+            persisted_view_settings,
+            "statuses",
+            status_options,
+        ),
+        key=f"status_{reset_token}",
+    )
+    priorities = st.multiselect(
+        "Priority",
+        priority_options,
+        default=safe_setting_list(
+            persisted_view_settings,
+            "priorities",
+            priority_options,
+        ),
+        key=f"priority_{reset_token}",
+    )
+    target_types = st.multiselect(
+        "Target type",
+        target_type_options,
+        default=safe_setting_list(
+            persisted_view_settings,
+            "target_types",
+            target_type_options,
+        ),
+        key=f"type_{reset_token}",
+    )
+    campaigns = st.multiselect(
+        "Campaign",
+        campaign_options,
+        default=safe_setting_list(
+            persisted_view_settings,
+            "campaigns",
+            campaign_options,
+        ),
+        key=f"campaign_{reset_token}",
+    )
+    owners = st.multiselect(
+        "Owner",
+        owner_options,
+        default=safe_setting_list(
+            persisted_view_settings,
+            "owners",
+            owner_options,
+        ),
+        key=f"owner_{reset_token}",
+    )
+    include_cancelled = st.checkbox(
+        "Include cancelled targets",
+        value=safe_bool(
+            persisted_view_settings,
+            "include_cancelled",
+            False,
+        ),
+        key=f"cancelled_{reset_token}",
+    )
+
+    valid_dates = pd.concat(
+        [master_df["Start_Date"], master_df["End_Date"]]
+    ).dropna()
     if valid_dates.empty:
         min_date = date.today() - timedelta(days=30)
         max_date = date.today() + timedelta(days=365)
     else:
         min_date = valid_dates.min().date()
         max_date = valid_dates.max().date()
+
+    saved_date_window = persisted_view_settings.get("date_window", [])
+    saved_start = (
+        parse_saved_date(saved_date_window[0])
+        if isinstance(saved_date_window, list)
+        and len(saved_date_window) == 2
+        else None
+    )
+    saved_end = (
+        parse_saved_date(saved_date_window[1])
+        if isinstance(saved_date_window, list)
+        and len(saved_date_window) == 2
+        else None
+    )
+
+    default_window_start = saved_start or min_date
+    default_window_end = saved_end or max_date
+    if default_window_end < default_window_start:
+        default_window_start, default_window_end = (
+            default_window_end,
+            default_window_start,
+        )
+
+    date_minimum = min(
+        min_date - timedelta(days=365),
+        default_window_start,
+    )
+    date_maximum = max(
+        max_date + timedelta(days=365),
+        default_window_end,
+    )
+
     date_window = st.date_input(
         "Schedule window",
-        value=(min_date, max_date),
-        min_value=min_date - timedelta(days=365),
-        max_value=max_date + timedelta(days=365),
+        value=(default_window_start, default_window_end),
+        min_value=date_minimum,
+        max_value=date_maximum,
         key=f"date_{reset_token}",
     )
     if not isinstance(date_window, tuple) or len(date_window) != 2:
         date_window = (min_date, max_date)
 
     if st.button("Clear all filters", use_container_width=True):
+        cleared_settings = dict(persisted_view_settings)
+        for key in [
+            "search",
+            "reservoirs",
+            "areas",
+            "rigs",
+            "statuses",
+            "priorities",
+            "target_types",
+            "campaigns",
+            "owners",
+            "include_cancelled",
+            "date_window",
+        ]:
+            cleared_settings.pop(key, None)
+
+        write_persisted_view_settings(cleared_settings)
         st.session_state.filter_reset_token += 1
         st.rerun()
 
     st.divider()
     st.subheader("Gantt settings")
 
+    gantt_type_options = [
+        "Detailed target rows",
+        "Compact merged lanes",
+        "Grouped target rows",
+    ]
     gantt_type = st.selectbox(
         "Gantt chart type",
-        [
-            "Detailed target rows",
-            "Compact merged lanes",
-            "Grouped target rows",
-        ],
-        index=0,
+        gantt_type_options,
+        index=safe_select_index(
+            gantt_type_options,
+            persisted_view_settings.get("gantt_type"),
+            0,
+        ),
+        key="gantt_type_widget",
         help=(
-            "Detailed gives one row per target. Compact merges all visible targets "
-            "sharing the selected Y-axis value onto one lane. Grouped keeps one row "
-            "per target and prefixes it with the selected Y-axis column."
+            "Detailed gives one row per target. Compact merges all visible "
+            "targets sharing the selected Y-axis value onto one lane. "
+            "Grouped keeps one row per target."
         ),
     )
 
+    y_axis_options = [
+        "Rig",
+        "Pad",
+        "Reservoir",
+        "Area",
+        "Campaign",
+        "Owner",
+        "Status",
+        "Priority",
+        "Target_Type",
+    ]
     y_axis_column = st.selectbox(
         "Left-side Y-axis column",
-        [
-            "Rig",
-            "Pad",
-            "Reservoir",
-            "Area",
-            "Campaign",
-            "Owner",
-            "Status",
-            "Priority",
-            "Target_Type",
-        ],
-        index=0,
-        help=(
-            "Used by Compact merged lanes and Grouped target rows. "
-            "The lanes update automatically after every active filter."
+        y_axis_options,
+        index=safe_select_index(
+            y_axis_options,
+            persisted_view_settings.get("y_axis_column"),
+            0,
         ),
+        key="y_axis_column_widget",
     )
 
+    color_mode_options = [
+        "Custom row color",
+        "Status",
+        "Priority",
+        "Rig",
+        "Reservoir",
+        "Area",
+        "Target_Type",
+        "Campaign",
+    ]
     color_mode = st.selectbox(
         "Color bars by",
-        [
-            "Custom row color",
-            "Status",
-            "Priority",
-            "Rig",
-            "Reservoir",
-            "Area",
-            "Target_Type",
-            "Campaign",
-        ],
-        index=0,
+        color_mode_options,
+        index=safe_select_index(
+            color_mode_options,
+            persisted_view_settings.get("color_mode"),
+            0,
+        ),
+        key="color_mode_widget",
     )
 
+    group_by_options = [
+        "Rig",
+        "Pad",
+        "Area",
+        "Reservoir",
+        "Campaign",
+        "Owner",
+        "Status",
+    ]
     group_by = st.selectbox(
         "Sort/group detailed rows by",
-        ["Rig", "Pad", "Area", "Reservoir", "Campaign", "Owner", "Status"],
-        index=0,
-        help="Used as the main sorting and separator field in Detailed target rows.",
+        group_by_options,
+        index=safe_select_index(
+            group_by_options,
+            persisted_view_settings.get("group_by"),
+            0,
+        ),
+        key="group_by_widget",
     )
 
+    label_mode_options = [
+        "Target ID + well",
+        "Well name",
+        "Rig + well",
+        "Target ID",
+    ]
     label_mode = st.selectbox(
         "Target label format",
-        ["Target ID + well", "Well name", "Rig + well", "Target ID"],
-        index=0,
+        label_mode_options,
+        index=safe_select_index(
+            label_mode_options,
+            persisted_view_settings.get("label_mode"),
+            0,
+        ),
+        key="label_mode_widget",
+    )
+
+    bar_text_options = [
+        "Target name + progress %",
+        "Target name only",
+        "Progress % only",
+        "No text",
+    ]
+    bar_text_mode = st.selectbox(
+        "Text inside bars",
+        bar_text_options,
+        index=safe_select_index(
+            bar_text_options,
+            persisted_view_settings.get("bar_text_mode"),
+            0,
+        ),
+        key="bar_text_mode_widget",
         help=(
-            "Controls detailed row labels and the target-name portion of text "
-            "shown inside each Gantt bar."
+            "The target name is drawn above progress shading and remains visible."
         ),
     )
 
-    bar_text_mode = st.selectbox(
-        "Text inside bars",
-        [
-            "Target name + progress %",
-            "Target name only",
-            "Progress % only",
-            "No text",
-        ],
-        index=0,
-        help="Target name uses the Well_Name field and is drawn above progress shading so it remains visible.",
+    show_today = st.checkbox(
+        "Show today line",
+        value=safe_bool(
+            persisted_view_settings,
+            "show_today",
+            True,
+        ),
+        key="show_today_widget",
+    )
+    show_progress = st.checkbox(
+        "Show progress shading",
+        value=safe_bool(
+            persisted_view_settings,
+            "show_progress",
+            True,
+        ),
+        key="show_progress_widget",
+    )
+    show_horizontal_grid = st.checkbox(
+        "Show horizontal grid lines",
+        value=safe_bool(
+            persisted_view_settings,
+            "show_horizontal_grid",
+            True,
+        ),
+        key="show_horizontal_grid_widget",
     )
 
-    show_today = st.checkbox("Show today line", value=True)
-    show_progress = st.checkbox("Show progress shading", value=True)
-    show_horizontal_grid = st.checkbox("Show horizontal grid lines", value=True)
+    saved_height = persisted_view_settings.get("height_per_row", 34)
+    try:
+        saved_height = int(saved_height)
+    except (TypeError, ValueError):
+        saved_height = 34
+    saved_height = min(max(saved_height, 24), 60)
+
     height_per_row = st.slider(
         "Row/lane height",
         min_value=24,
         max_value=60,
-        value=34,
+        value=saved_height,
         step=2,
+        key="height_per_row_widget",
     )
+
+    current_view_settings = create_view_settings(
+        visible_columns=visible_editor_columns,
+        search=search,
+        reservoirs=reservoirs,
+        areas=areas,
+        rigs=rigs,
+        statuses=statuses,
+        priorities=priorities,
+        target_types=target_types,
+        campaigns=campaigns,
+        owners=owners,
+        include_cancelled=include_cancelled,
+        date_window=date_window,
+        sor_folder_text=sor_folder_text,
+        gantt_type=gantt_type,
+        y_axis_column=y_axis_column,
+        color_mode=color_mode,
+        group_by=group_by,
+        label_mode=label_mode,
+        bar_text_mode=bar_text_mode,
+        show_today=show_today,
+        show_progress=show_progress,
+        show_horizontal_grid=show_horizontal_grid,
+        height_per_row=height_per_row,
+        source_file_name=st.session_state.get(
+            "source_file_name",
+            "",
+        ),
+        schedule_snapshot_id=st.session_state.get(
+            "schedule_snapshot_id",
+            "",
+        ),
+    )
+
+    # Keep the current filter/Gantt view after browser refresh.
+    write_persisted_view_settings(current_view_settings)
+
+    st.divider()
+    with st.expander("Save / load view template", expanded=False):
+        st.caption(
+            "Filters and chart settings are saved in the page URL. The JSON "
+            "template also contains the complete current schedule, so loading it "
+            "restores both the CSV data and the view."
+        )
+
+        template_name = st.text_input(
+            "Template name",
+            value="NWD_View",
+            key="view_template_name",
+        )
+        safe_template_name = re.sub(
+            r"[^A-Za-z0-9._-]+",
+            "_",
+            template_name.strip(),
+        ).strip("._-") or "NWD_View"
+
+        st.download_button(
+            "⬇ Download settings template",
+            data=view_template_bytes(
+                current_view_settings,
+                template_name,
+                master_df,
+                st.session_state.get("source_file_name", ""),
+            ),
+            file_name=f"{safe_template_name}.json",
+            mime="application/json",
+            use_container_width=True,
+        )
+
+        uploaded_view_template = st.file_uploader(
+            "Load settings template",
+            type=["json"],
+            key="view_template_uploader",
+        )
+
+        apply_template_col, reset_view_col = st.columns(2)
+
+        if apply_template_col.button(
+            "Apply template",
+            use_container_width=True,
+            disabled=uploaded_view_template is None,
+        ):
+            try:
+                (
+                    loaded_settings,
+                    restored_schedule,
+                    restored_source_file_name,
+                ) = read_uploaded_view_template(
+                    uploaded_view_template
+                )
+
+                if restored_schedule is not None:
+                    set_master(restored_schedule, add_undo=True)
+                    st.session_state.source_file_name = (
+                        restored_source_file_name
+                    )
+                    st.session_state.source_name = (
+                        restored_source_file_name
+                        or "Schedule restored from template"
+                    )
+                    snapshot_id = save_schedule_snapshot(
+                        restored_schedule,
+                        restored_source_file_name,
+                    )
+                    st.session_state.schedule_snapshot_id = snapshot_id
+                    loaded_settings["schedule_snapshot_id"] = snapshot_id
+                    loaded_settings["source_file_name"] = (
+                        restored_source_file_name
+                    )
+
+                write_persisted_view_settings(loaded_settings)
+                clear_view_widget_state()
+                st.session_state.filter_reset_token += 1
+                st.success("Schedule and view template applied.")
+                st.rerun()
+            except Exception as exc:
+                st.error(
+                    f"Could not load settings template: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+
+        if reset_view_col.button(
+            "Reset defaults",
+            use_container_width=True,
+        ):
+            schedule_reference = {
+                "source_file_name": st.session_state.get(
+                    "source_file_name",
+                    "",
+                ),
+                "schedule_snapshot_id": st.session_state.get(
+                    "schedule_snapshot_id",
+                    "",
+                ),
+            }
+            write_persisted_view_settings(schedule_reference)
+            clear_view_widget_state()
+            st.session_state.filter_reset_token += 1
+            st.session_state.pop("view_template_uploader", None)
+            st.rerun()
+
 
 filtered_df = apply_filters(
     master_df,
@@ -1785,28 +2577,9 @@ with tab_gantt:
         st.session_state.selected_sor_target_id = clicked_target_id
 
     st.caption(
-        "Click a target bar, its progress section, or its text label to open the "
-        "matching SoR PDF. Hidden table columns are also hidden from mouse-over text."
+        "Move the mouse over a target: the pointer changes to a hand. "
+        "Click the bar, progress section or target text to open the matching SoR PDF."
     )
-
-    manual_col, clear_col = st.columns([3, 1])
-    manual_target_id = manual_col.selectbox(
-        "SoR fallback selection",
-        options=[""] + master_df["Target_ID"].astype(str).tolist(),
-        format_func=lambda value: "Select a target manually..." if value == "" else value,
-        key="manual_sor_target",
-    )
-    if manual_target_id:
-        st.session_state.selected_sor_target_id = manual_target_id
-
-    if clear_col.button(
-        "Close SoR",
-        use_container_width=True,
-        disabled=not st.session_state.selected_sor_target_id,
-    ):
-        st.session_state.selected_sor_target_id = ""
-        st.session_state.gantt_selection_token += 1
-        st.rerun()
 
     selected_target_id = st.session_state.get("selected_sor_target_id", "")
     if selected_target_id:
@@ -1825,20 +2598,35 @@ with tab_gantt:
             )
 
             st.markdown("---")
-            st.subheader(
-                f"SoR — {selected_row['Target_ID']} | {selected_row['Well_Name']}"
+            sor_title_col, sor_close_col = st.columns([5, 1])
+            sor_title_col.subheader(
+                f"SoR — {selected_row['Target_ID']} | "
+                f"{selected_row['Well_Name']}"
             )
+            if sor_close_col.button(
+                "Close SoR",
+                use_container_width=True,
+                key=f"close_sor_{selected_target_id}",
+            ):
+                st.session_state.selected_sor_target_id = ""
+                st.session_state.gantt_selection_token += 1
+                st.rerun()
+
             if document is None:
-                expected_name = str(selected_row.get("SoR_File", "") or "").strip()
+                expected_name = str(
+                    selected_row.get("SoR_File", "") or ""
+                ).strip()
                 detail = (
                     f" Expected file: `{expected_name}`."
                     if expected_name
                     else ""
                 )
                 st.warning(
-                    f"SoR not found for {selected_target_id}.{detail} "
-                    "Add the PDF to the configured input folder, upload it from the "
-                    "sidebar, or populate the SoR_File column."
+                    f"SoR not found for {selected_target_id}.{detail}"
+                )
+                st.caption(
+                    "Add the PDF to the configured input folder, upload it "
+                    "from the sidebar, or populate the SoR_File column."
                 )
             else:
                 show_pdf_viewer(document, selected_target_id)
@@ -1954,7 +2742,7 @@ with tab_edit:
                 visible_editor_columns,
             )
             set_master(updated, add_undo=True)
-            st.session_state.source_name = "Edited in NWD Scheduler v1.5.1"
+            st.session_state.source_name = "Edited in NWD Scheduler v1.6.1"
             st.success("Edits applied to the complete master schedule.")
             st.rerun()
         except Exception as exc:
@@ -2209,7 +2997,7 @@ with tab_summary:
 with tab_help:
     st.markdown(
         """
-        ### NWD Scheduler v1.5.1 workflow
+        ### NWD Scheduler v1.6.1 workflow
         1. The application opens with an **empty schedule**.
         2. Upload an Excel/CSV schedule or add items manually.
         3. Choose visible columns under **Table & tooltip columns**. Hidden table
@@ -2220,8 +3008,14 @@ with tab_help:
            amended master schedule.
         6. Put SoR PDFs in the `input` folder beside the Python file, upload PDFs
            temporarily from the sidebar, and optionally populate `SoR_File`.
-        7. Click a Gantt target to open its matching SoR PDF. If no match exists,
-           the application displays **SoR not found**.
+        7. Click a Gantt target to open its matching SoR PDF. The mouse pointer
+           changes to a hand over clickable chart items.
+        8. Use **Save / load view template** to download a portable JSON file.
+           It contains the complete current schedule plus all filters and chart settings.
+        9. The active schedule is linked to the page URL through a server snapshot,
+           so browser refresh restores the Gantt instead of opening empty.
+        10. Use **Reset defaults** to clear filters and chart settings while keeping
+            the current schedule loaded.
 
         ### SoR filename matching
         The most reliable method is to populate `SoR_File`, for example
@@ -2229,6 +3023,9 @@ with tab_help:
         `Target_ID` and `Well_Name`.
 
         ### Streamlit Cloud
+        A browser cannot automatically reopen the original CSV path on your
+        computer. Therefore the JSON template embeds the current CSV data itself.
+
         A cloud app cannot read a folder on your personal computer. For cloud use,
         either:
         - add permitted PDFs to the repository's `input` folder, or
@@ -2243,4 +3040,4 @@ with tab_help:
     )
 
 st.divider()
-st.caption("NWD Scheduler v1.5.1 • Empty start • Highlighted technology items • Dynamic tooltips • Click-to-open SoR")
+st.caption("NWD Scheduler v1.6.1 • Empty start • Highlighted technology items • Dynamic tooltips • Click-to-open SoR")
