@@ -1,13 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-NWD Scheduler v1.6.1.1 - Streamlit application
+NWD Scheduler v1.7.0 - Streamlit application
 
 Run:
-    streamlit run nwd_scheduler_v1.6.1.py
+    streamlit run NWD_Scheduler_v1.7.0.py
 
 The application opens with an empty schedule. Upload an Excel/CSV schedule
-when required. Place SoR PDF documents in an "input" folder beside this Python
-file, or upload PDFs temporarily from the sidebar.
+when required. Place linked PDF documents in an "input" folder beside this
+Python file, or upload PDFs temporarily from the sidebar. Each schedule item
+can use its own document name, such as SoR, WCS, ToR, or any custom label.
 
 Outputs are CSV-based.
 """
@@ -21,9 +22,10 @@ import io
 import json
 import math
 import re
+import sqlite3
 import zipfile
 import uuid
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -46,12 +48,14 @@ st.set_page_config(
 )
 
 APP_DIR = Path(__file__).resolve().parent
-DEFAULT_SOR_DIR = APP_DIR / "input"
+DEFAULT_DOCUMENT_DIR = APP_DIR / "input"
 COMPUTED_COLUMNS = ["Duration_Days", "Start_Year", "End_Year"]
 INTERNAL_ROW_KEY = "__Original_Target_ID"
 HIGHLIGHT_COLOR = "#7C3AED"
 SCHEDULE_STATE_DIR = Path.home() / ".nwd_scheduler_state"
 SCHEDULE_SNAPSHOT_PATTERN = re.compile(r"^[a-f0-9]{32}$")
+USAGE_DB_PATH = SCHEDULE_STATE_DIR / "usage.sqlite3"
+ACTIVE_USER_MINUTES = 15
 
 REQUIRED_COLUMNS = [
     "Target_ID",
@@ -71,7 +75,8 @@ REQUIRED_COLUMNS = [
     "Color",
     "Highlight",
     "Highlight_Label",
-    "SoR_File",
+    "Document_Name",
+    "Document_File",
     "Notes",
 ]
 
@@ -89,7 +94,8 @@ TEXT_COLUMNS = [
     "Campaign",
     "Color",
     "Highlight_Label",
-    "SoR_File",
+    "Document_Name",
+    "Document_File",
     "Notes",
 ]
 
@@ -99,8 +105,9 @@ BOOLEAN_COLUMNS = ["Highlight"]
 STATUS_OPTIONS = ["Not Started", "Ready", "In Progress", "On Hold", "Completed", "Cancelled"]
 PRIORITY_OPTIONS = ["Critical", "High", "Medium", "Low"]
 TARGET_TYPE_OPTIONS = [
-    "Producer", "Water Injector", "Observation", "Disposal", "Appraisal",
-    "TAR", "Drilling Break", "Rig Maintenance", "Rig Move", "New Technology",
+    "Producer", "Water Injector", "Gas Injector", "Observation", "Disposal",
+    "Appraisal", "TAR", "Drilling Break", "Rig Maintenance", "Rig Move",
+    "New Technology", "Other Event",
 ]
 RESERVOIR_OPTIONS = ["Main Pay", "Upper Shale", "Mishrif", "Nahr Umr"]
 AREA_OPTIONS = ["North", "South"]
@@ -161,11 +168,30 @@ COLUMN_ALIASES = {
     "new_technology": "Highlight",
     "highlight label": "Highlight_Label",
     "highlight_label": "Highlight_Label",
-    "sor": "SoR_File",
-    "sor file": "SoR_File",
-    "sor_file": "SoR_File",
-    "sor document": "SoR_File",
-    "sor_document": "SoR_File",
+    "document name": "Document_Name",
+    "document_name": "Document_Name",
+    "document title": "Document_Name",
+    "document_title": "Document_Name",
+    "document type": "Document_Name",
+    "document_type": "Document_Name",
+    "document file": "Document_File",
+    "document_file": "Document_File",
+    "linked document": "Document_File",
+    "linked_document": "Document_File",
+    # Backward compatibility with existing schedule files.
+    "sor": "Document_File",
+    "sor file": "Document_File",
+    "sor_file": "Document_File",
+    "sor document": "Document_File",
+    "sor_document": "Document_File",
+    "event id": "Target_ID",
+    "event_id": "Target_ID",
+    "item id": "Target_ID",
+    "item_id": "Target_ID",
+    "event name": "Well_Name",
+    "event_name": "Well_Name",
+    "item name": "Well_Name",
+    "item_name": "Well_Name",
     "notes": "Notes",
     "comments": "Notes",
 }
@@ -192,7 +218,7 @@ st.markdown(
           margin-bottom: 0.75rem;
       }
 
-      /* Make Gantt bars visibly clickable for SoR opening. */
+      /* Make Gantt bars visibly clickable for linked-document opening. */
       [data-testid="stPlotlyChart"] .plotly .barlayer path,
       [data-testid="stPlotlyChart"] .plotly .scatterlayer text,
       [data-testid="stPlotlyChart"] .plotly .scatterlayer .point,
@@ -244,7 +270,25 @@ def normalize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     else:
         df = df.copy()
 
+    original_column_names = [str(column).strip().lower() for column in df.columns]
+    legacy_sor_column = any(
+        name in {"sor", "sor file", "sor_file", "sor document", "sor_document"}
+        for name in original_column_names
+    )
     df.columns = [clean_column_name(c) for c in df.columns]
+
+    # If old and new document columns are both present, combine them safely.
+    if df.columns.duplicated().any():
+        combined_columns: Dict[str, pd.Series] = {}
+        for column in dict.fromkeys(df.columns):
+            matches = df.loc[:, df.columns == column]
+            combined = matches.iloc[:, 0]
+            for duplicate_index in range(1, matches.shape[1]):
+                fallback = matches.iloc[:, duplicate_index]
+                populated = combined.notna() & combined.astype(str).str.strip().ne("")
+                combined = combined.where(populated, fallback)
+            combined_columns[column] = combined
+        df = pd.DataFrame(combined_columns)
 
     for col in REQUIRED_COLUMNS:
         if col not in df.columns:
@@ -267,6 +311,10 @@ def normalize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     for col in TEXT_COLUMNS:
         if col in df.columns:
             df[col] = df[col].fillna("").astype(str).str.strip()
+
+    if legacy_sor_column:
+        legacy_document_rows = df["Document_File"].ne("") & df["Document_Name"].eq("")
+        df.loc[legacy_document_rows, "Document_Name"] = "SoR"
 
     df["Progress_Pct"] = (
         pd.to_numeric(df["Progress_Pct"], errors="coerce")
@@ -365,6 +413,133 @@ def set_master(df: pd.DataFrame, add_undo: bool = True) -> None:
     st.session_state.schedule_df = new_df
 
 
+def authenticated_user_identity() -> Tuple[str, str, str]:
+    """Return a stable Streamlit-auth identity without exposing auth tokens."""
+    try:
+        user = getattr(st, "user", None)
+        if user is None:
+            return "", "", ""
+        if hasattr(user, "to_dict"):
+            values = user.to_dict()
+        elif isinstance(user, dict):
+            values = dict(user)
+        else:
+            values = {}
+        if not bool(values.get("is_logged_in", False)):
+            return "", "", ""
+
+        email = str(
+            values.get("email")
+            or values.get("preferred_username")
+            or ""
+        ).strip()
+        display_name = str(
+            values.get("name")
+            or values.get("given_name")
+            or email
+            or "Authenticated user"
+        ).strip()
+        stable_claim = str(
+            values.get("oid")
+            or values.get("sub")
+            or email
+            or display_name
+        ).strip()
+        return f"auth:{stable_claim}", display_name[:120], email[:160]
+    except Exception:
+        return "", "", ""
+
+
+def record_user_activity(
+    session_id: str,
+    user_key: str,
+    display_name: str,
+    email: str = "",
+) -> None:
+    """Record one session heartbeat in the app server's lightweight database."""
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    try:
+        SCHEDULE_STATE_DIR.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(USAGE_DB_PATH, timeout=5) as connection:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS usage_sessions (
+                    session_id TEXT PRIMARY KEY,
+                    user_key TEXT NOT NULL,
+                    display_name TEXT NOT NULL,
+                    email TEXT NOT NULL DEFAULT '',
+                    first_seen TEXT NOT NULL,
+                    last_seen TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO usage_sessions (
+                    session_id, user_key, display_name, email,
+                    first_seen, last_seen
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    user_key = excluded.user_key,
+                    display_name = excluded.display_name,
+                    email = excluded.email,
+                    last_seen = excluded.last_seen
+                """,
+                (
+                    str(session_id),
+                    str(user_key),
+                    str(display_name)[:120],
+                    str(email)[:160],
+                    now,
+                    now,
+                ),
+            )
+            connection.commit()
+    except (OSError, sqlite3.Error):
+        # Usage visibility is optional and must never interrupt the scheduler.
+        pass
+
+
+def usage_summary() -> Tuple[List[Dict[str, object]], int, int]:
+    """Return active identities, total identities and total opened sessions."""
+    if not USAGE_DB_PATH.exists():
+        return [], 0, 0
+
+    active_after = (
+        datetime.now(timezone.utc) - timedelta(minutes=ACTIVE_USER_MINUTES)
+    ).isoformat(timespec="seconds")
+    try:
+        with sqlite3.connect(USAGE_DB_PATH, timeout=5) as connection:
+            connection.row_factory = sqlite3.Row
+            rows = connection.execute(
+                """
+                SELECT
+                    user_key,
+                    MAX(display_name) AS display_name,
+                    MAX(email) AS email,
+                    MIN(first_seen) AS first_seen,
+                    MAX(last_seen) AS last_seen,
+                    COUNT(*) AS session_count
+                FROM usage_sessions
+                GROUP BY user_key
+                ORDER BY last_seen DESC
+                """
+            ).fetchall()
+            total_sessions = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM usage_sessions"
+                ).fetchone()[0]
+            )
+    except sqlite3.Error:
+        return [], 0, 0
+
+    users = [dict(row) for row in rows]
+    active_users = [
+        user for user in users if str(user.get("last_seen", "")) >= active_after
+    ]
+    return active_users, len(users), total_sessions
+
+
 
 def merge_filtered_edits(
     master_df: pd.DataFrame,
@@ -452,10 +627,17 @@ def initialize_state() -> None:
 
     st.session_state.setdefault("undo_stack", [])
     st.session_state.setdefault("filter_reset_token", 0)
-    st.session_state.setdefault("uploaded_sor_files", {})
-    st.session_state.setdefault("selected_sor_target_id", "")
+    st.session_state.setdefault(
+        "uploaded_document_files",
+        st.session_state.pop("uploaded_sor_files", {}),
+    )
+    st.session_state.setdefault(
+        "selected_document_item_id",
+        st.session_state.pop("selected_sor_target_id", ""),
+    )
     st.session_state.setdefault("gantt_selection_token", 0)
     st.session_state.setdefault("schedule_snapshot_id", "")
+    st.session_state.setdefault("usage_session_id", uuid.uuid4().hex)
 
 
 
@@ -582,7 +764,7 @@ def dataframe_from_embedded_payload(
 
 VIEW_WIDGET_KEYS = [
     "visible_columns_widget",
-    "sor_folder_widget",
+    "document_folder_widget",
     "gantt_type_widget",
     "y_axis_column_widget",
     "color_mode_widget",
@@ -713,7 +895,7 @@ def create_view_settings(
     owners: Sequence[str],
     include_cancelled: bool,
     date_window: Tuple[date, date],
-    sor_folder_text: str,
+    document_folder_text: str,
     gantt_type: str,
     y_axis_column: str,
     color_mode: str,
@@ -745,7 +927,7 @@ def create_view_settings(
             date_window[0].isoformat(),
             date_window[1].isoformat(),
         ],
-        "sor_folder": str(sor_folder_text),
+        "document_folder": str(document_folder_text),
         "gantt_type": str(gantt_type),
         "y_axis_column": str(y_axis_column),
         "color_mode": str(color_mode),
@@ -872,7 +1054,7 @@ def validate_schedule(df: pd.DataFrame) -> pd.DataFrame:
 
     duplicated = df["Target_ID"].duplicated(keep=False)
     for _, row in df[duplicated].iterrows():
-        issues.append({"Severity": "Error", "Target_ID": row["Target_ID"], "Field": "Target_ID", "Issue": "Target ID is duplicated."})
+        issues.append({"Severity": "Error", "Target_ID": row["Target_ID"], "Field": "Target_ID", "Issue": "Item / event ID is duplicated."})
 
     for _, row in df.iterrows():
         target = row["Target_ID"]
@@ -964,14 +1146,15 @@ def editable_schedule_columns(df: pd.DataFrame) -> List[str]:
 
 def column_display_name(column: str) -> str:
     labels = {
-        "Target_ID": "Target ID",
-        "Well_Name": "Well name",
-        "Target_Type": "Target type",
+        "Target_ID": "Item / event ID",
+        "Well_Name": "Well / event name",
+        "Target_Type": "Item type",
         "Start_Date": "Start date",
         "End_Date": "End date",
         "Progress_Pct": "Progress %",
         "Highlight_Label": "Highlight label",
-        "SoR_File": "SoR file",
+        "Document_Name": "Document name",
+        "Document_File": "Document file",
     }
     return labels.get(column, column.replace("_", " "))
 
@@ -1004,13 +1187,13 @@ def build_editor_column_config(
     """
     known_config: Dict[str, object] = {
         "Target_ID": st.column_config.TextColumn(
-            "Target ID",
+            "Item / event ID",
             required=False,
             width="small",
             help="Blank or duplicate IDs are corrected automatically after Apply.",
         ),
         "Well_Name": st.column_config.TextColumn(
-            "Well name",
+            "Well / event name",
             required=False,
             width="small",
         ),
@@ -1035,7 +1218,7 @@ def build_editor_column_config(
             width="small",
         ),
         "Target_Type": st.column_config.TextColumn(
-            "Target type",
+            "Item type",
             required=False,
             width="medium",
             help=(
@@ -1083,10 +1266,13 @@ def build_editor_column_config(
             width="medium",
         ),
         "Color": st.column_config.TextColumn(
-            "Hex color",
+            "Stored bar color",
             required=False,
             width="small",
-            help="Example: #2563EB",
+            help=(
+                "Normally keep this technical value hidden and use the visual "
+                "color pickers below the table or in Bulk Actions."
+            ),
         ),
         "Highlight": st.column_config.CheckboxColumn(
             "Highlight",
@@ -1099,11 +1285,17 @@ def build_editor_column_config(
             width="medium",
             help="Example: New Technology",
         ),
-        "SoR_File": st.column_config.TextColumn(
-            "SoR file",
+        "Document_Name": st.column_config.TextColumn(
+            "Document name",
+            required=False,
+            width="medium",
+            help="User-defined label, for example SoR, WCS, ToR, or another name.",
+        ),
+        "Document_File": st.column_config.TextColumn(
+            "Document file",
             required=False,
             width="large",
-            help="PDF filename stored in the configured input folder.",
+            help="PDF filename stored in the configured document folder.",
         ),
         "Notes": st.column_config.TextColumn(
             "Notes",
@@ -1184,10 +1376,10 @@ def updated_input_filename(source_name: str) -> str:
     return f"{safe_filename_stem(source_name)}_updated.csv"
 
 
-def resolve_sor_directory(folder_text: str) -> Path:
+def resolve_document_directory(folder_text: str) -> Path:
     folder_text = str(folder_text or "").strip()
     if not folder_text:
-        return DEFAULT_SOR_DIR
+        return DEFAULT_DOCUMENT_DIR
     candidate = Path(folder_text).expanduser()
     return candidate if candidate.is_absolute() else APP_DIR / candidate
 
@@ -1212,16 +1404,16 @@ def local_pdf_files(folder: Path) -> List[Path]:
         return []
 
 
-def resolve_sor_document(
-    target_row: pd.Series,
-    sor_directory: Path,
+def resolve_document(
+    item_row: pd.Series,
+    document_directory: Path,
     uploaded_files: Dict[str, bytes],
 ) -> Optional[Dict[str, object]]:
     """
-    Resolve an SoR PDF using:
-    1. The row's SoR_File value.
-    2. Exact Target_ID or Well_Name filename matching.
-    3. Partial Target_ID or Well_Name filename matching.
+    Resolve a linked PDF using:
+    1. The row's Document_File value.
+    2. Exact item/event ID or well/event name filename matching.
+    3. Partial item/event ID or well/event name filename matching.
     """
     uploaded_lookup = {
         name.lower(): {"name": name, "bytes": content, "source": "Uploaded PDF"}
@@ -1229,10 +1421,10 @@ def resolve_sor_document(
         if str(name).lower().endswith(".pdf")
     }
 
-    local_files = local_pdf_files(sor_directory)
+    local_files = local_pdf_files(document_directory)
     local_lookup = {path.name.lower(): path for path in local_files}
 
-    requested = str(target_row.get("SoR_File", "") or "").strip()
+    requested = str(item_row.get("Document_File", "") or "").strip()
     if requested:
         requested_name = Path(requested).name.lower()
         if requested_name in uploaded_lookup:
@@ -1245,7 +1437,7 @@ def resolve_sor_document(
         else:
             possible_paths.extend(
                 [
-                    sor_directory / requested_path,
+                    document_directory / requested_path,
                     APP_DIR / requested_path,
                 ]
             )
@@ -1275,11 +1467,11 @@ def resolve_sor_document(
                     "source": str(path),
                 }
 
-    target_keys = [
-        normalized_document_key(target_row.get("Target_ID", "")),
-        normalized_document_key(target_row.get("Well_Name", "")),
+    item_keys = [
+        normalized_document_key(item_row.get("Target_ID", "")),
+        normalized_document_key(item_row.get("Well_Name", "")),
     ]
-    target_keys = [key for key in target_keys if key]
+    item_keys = [key for key in item_keys if key]
 
     candidates: List[Dict[str, object]] = list(uploaded_lookup.values())
     for path in local_files:
@@ -1297,12 +1489,12 @@ def resolve_sor_document(
     exact_matches = [
         candidate
         for candidate in candidates
-        if candidate_key(candidate) in target_keys
+        if candidate_key(candidate) in item_keys
     ]
     partial_matches = [
         candidate
         for candidate in candidates
-        if any(key in candidate_key(candidate) for key in target_keys)
+        if any(key in candidate_key(candidate) for key in item_keys)
     ]
 
     matches = exact_matches or partial_matches
@@ -1317,6 +1509,21 @@ def resolve_sor_document(
         except OSError:
             return None
     return selected
+
+
+def document_display_name(
+    item_row: pd.Series,
+    document: Optional[Dict[str, object]] = None,
+) -> str:
+    """Return the user's label, with a sensible fallback for older inputs."""
+    explicit_name = str(item_row.get("Document_Name", "") or "").strip()
+    if explicit_name:
+        return explicit_name
+
+    requested_file = str(item_row.get("Document_File", "") or "").strip()
+    resolved_file = str((document or {}).get("name", "") or "").strip()
+    fallback_file = requested_file or resolved_file
+    return Path(fallback_file).stem if fallback_file else "Linked document"
 
 
 def extract_selected_target_id(event: object) -> str:
@@ -1337,19 +1544,23 @@ def extract_selected_target_id(event: object) -> str:
     return ""
 
 
-def show_pdf_viewer(document: Dict[str, object], target_id: str) -> None:
+def show_pdf_viewer(
+    document: Dict[str, object],
+    item_id: str,
+    document_name: str,
+) -> None:
     pdf_bytes = bytes(document["bytes"])
     file_name = str(document["name"])
 
     info_col, download_col = st.columns([3, 1])
-    info_col.success(f"SoR found for {target_id}: {file_name}")
+    info_col.success(f"{document_name} found for {item_id}: {file_name}")
     download_col.download_button(
-        "Download SoR PDF",
+        f"Download {document_name}",
         data=pdf_bytes,
         file_name=file_name,
         mime="application/pdf",
         use_container_width=True,
-        key=f"download_sor_{target_id}_{normalized_document_key(file_name)}",
+        key=f"download_document_{item_id}_{normalized_document_key(file_name)}",
     )
 
     if hasattr(st, "pdf"):
@@ -1357,7 +1568,7 @@ def show_pdf_viewer(document: Dict[str, object], target_id: str) -> None:
             st.pdf(
                 pdf_bytes,
                 height=850,
-                key=f"sor_pdf_{target_id}_{normalized_document_key(file_name)}",
+                key=f"document_pdf_{item_id}_{normalized_document_key(file_name)}",
             )
             return
         except Exception:
@@ -1374,6 +1585,77 @@ def show_pdf_viewer(document: Dict[str, object], target_id: str) -> None:
         ),
         height=870,
         scrolling=True,
+    )
+
+
+def enable_zoom_aware_tooltips(base_font_size: int = 13) -> None:
+    """
+    Enlarge Plotly hover labels as the visible calendar range is zoomed in.
+
+    Streamlit's native Plotly event bridge currently reports point selections,
+    but not relayout/zoom events. This small browser-side listener keeps the
+    existing click-to-open behavior and adjusts only the hover-label font.
+    """
+    components.html(
+        f"""
+        <script>
+        (() => {{
+          const BASE_SIZE = {int(base_font_size)};
+          const MAX_SCALE = 2.4;
+
+          function rangeSpan(axis) {{
+            if (!axis || !Array.isArray(axis.range) || axis.range.length < 2) return 0;
+            const start = new Date(axis.range[0]).getTime();
+            const end = new Date(axis.range[1]).getTime();
+            return Number.isFinite(start) && Number.isFinite(end) ? Math.abs(end - start) : 0;
+          }}
+
+          function attach(attempt = 0) {{
+            try {{
+              const charts = window.parent.document.querySelectorAll(
+                '[data-testid="stPlotlyChart"] .js-plotly-plot'
+              );
+              const chart = charts[charts.length - 1];
+              if (!chart || !chart._fullLayout || typeof chart.on !== 'function') {{
+                if (attempt < 30) setTimeout(() => attach(attempt + 1), 100);
+                return;
+              }}
+
+              const initialSpan = rangeSpan(chart._fullLayout.xaxis);
+              if (!initialSpan) return;
+              chart.dataset.nwdTooltipInitialSpan = String(initialSpan);
+
+              const updateFont = () => {{
+                const baseline = Number(chart.dataset.nwdTooltipInitialSpan) || initialSpan;
+                const current = rangeSpan(chart._fullLayout.xaxis) || baseline;
+                const scale = Math.min(MAX_SCALE, Math.max(1, Math.sqrt(baseline / current)));
+                const size = Math.round(BASE_SIZE * scale);
+
+                chart.layout.hoverlabel = chart.layout.hoverlabel || {{}};
+                chart.layout.hoverlabel.font = chart.layout.hoverlabel.font || {{}};
+                chart.layout.hoverlabel.font.size = size;
+                if (chart._fullLayout.hoverlabel && chart._fullLayout.hoverlabel.font) {{
+                  chart._fullLayout.hoverlabel.font.size = size;
+                }}
+              }};
+
+              if (chart.dataset.nwdTooltipZoomAttached !== 'true') {{
+                chart.on('plotly_relayout', updateFont);
+                chart.on('plotly_hover', updateFont);
+                chart.dataset.nwdTooltipZoomAttached = 'true';
+              }}
+              updateFont();
+            }} catch (error) {{
+              if (attempt < 30) setTimeout(() => attach(attempt + 1), 100);
+            }}
+          }}
+
+          attach();
+        }})();
+        </script>
+        """,
+        height=0,
+        width=0,
     )
 
 
@@ -1395,7 +1677,7 @@ def build_gantt(
     if df.empty:
         fig = go.Figure()
         fig.add_annotation(
-            text="The schedule is empty. Upload a file or add a target.",
+            text="The schedule is empty. Upload a file or add an item.",
             x=0.5,
             y=0.5,
             showarrow=False,
@@ -1431,15 +1713,15 @@ def build_gantt(
             .replace("", "Unassigned")
         )
 
-    if label_mode == "Well name":
+    if label_mode in {"Well name", "Item / event name"}:
         plot_df["Task_Label"] = plot_df["Well_Name"].fillna("").astype(str)
-    elif label_mode == "Target ID + well":
+    elif label_mode in {"Target ID + well", "Item ID + name"}:
         plot_df["Task_Label"] = (
             plot_df["Target_ID"].fillna("").astype(str)
             + " | "
             + plot_df["Well_Name"].fillna("").astype(str)
         )
-    elif label_mode == "Rig + well":
+    elif label_mode in {"Rig + well", "Rig + name"}:
         plot_df["Task_Label"] = (
             plot_df["Rig"].fillna("").astype(str)
             + " | "
@@ -1488,7 +1770,6 @@ def build_gantt(
 
     if color_mode == "Custom row color":
         colors = plot_df["Color"].apply(valid_hex_color).tolist()
-        legend_title = None
     else:
         field = color_mode
         if field == "Status":
@@ -1498,7 +1779,7 @@ def build_gantt(
         else:
             cmap = category_color_map(plot_df[field])
         colors = plot_df[field].map(cmap).fillna(DEFAULT_COLOR).tolist()
-        legend_title = column_display_name(field)
+    plot_df["_Bar_Color"] = colors
 
     duration_ms = (
         (plot_df["End_Date"] - plot_df["Start_Date"]).dt.total_seconds() * 1000
@@ -1511,9 +1792,9 @@ def build_gantt(
         plot_df["Target_ID"].fillna("").astype(str),
     )
 
-    if bar_text_mode == "Target name + progress %":
+    if bar_text_mode in {"Target name + progress %", "Item name + progress %"}:
         bar_text = target_text + "<br>" + progress_text
-    elif bar_text_mode == "Target name only":
+    elif bar_text_mode in {"Target name only", "Item name only"}:
         bar_text = target_text
     elif bar_text_mode == "Progress % only":
         bar_text = progress_text
@@ -1536,7 +1817,13 @@ def build_gantt(
         values: List[object] = [
             str(row.get("Target_ID", "")),
             str(row.get("Well_Name", "")),
-            str(row.get("SoR_File", "")),
+            str(row.get("Document_File", "")),
+            str(row.get("Document_Name", "")),
+            (
+                "Click to open the linked PDF"
+                if str(row.get("Document_File", "") or "").strip()
+                else "Click to check for a matching PDF"
+            ),
         ]
         values.extend(
             format_hover_value(row.get(column, ""), column)
@@ -1545,12 +1832,12 @@ def build_gantt(
         customdata.append(values)
 
     hover_lines = []
-    for data_index, column in enumerate(tooltip_columns, start=3):
+    for data_index, column in enumerate(tooltip_columns, start=5):
         hover_lines.append(
             f"<b>{html.escape(column_display_name(column))}:</b> "
             f"%{{customdata[{data_index}]}}<br>"
         )
-    hover_lines.append("<i>Click to open the SoR PDF</i>")
+    hover_lines.append("<i>%{customdata[4]}</i>")
     hovertemplate = "".join(hover_lines) + "<extra></extra>"
 
     fig = go.Figure()
@@ -1693,13 +1980,13 @@ def build_gantt(
             "xanchor": "left",
             "font": {"size": 20},
         },
-        height=chart_height,
+        height=chart_height + 75,
         barmode="overlay",
         bargap=0.12 if gantt_type == "Compact merged lanes" else 0.24,
-        hoverlabel={"align": "left"},
+        hoverlabel={"align": "left", "font": {"size": 13}},
         clickmode="event+select",
-        selectionrevision="nwd-v1.6.1",
-        margin={"l": 20, "r": 25, "t": 88, "b": 10},
+        selectionrevision="nwd-v1.7.0",
+        margin={"l": 20, "r": 25, "t": 88, "b": 95},
         uniformtext={"mode": "hide", "minsize": 8},
         xaxis={
             "title": "Calendar date",
@@ -1733,7 +2020,36 @@ def build_gantt(
         font={"family": "Arial, sans-serif"},
     )
 
-    if color_mode != "Custom row color":
+    if color_mode == "Custom row color":
+        # In custom mode, explain each visible color using the item types that
+        # actually use it. This keeps the legend accurate without showing hex.
+        for color in plot_df["_Bar_Color"].drop_duplicates().tolist():
+            color_rows = plot_df[plot_df["_Bar_Color"] == color]
+            item_types = [
+                value
+                for value in color_rows["Target_Type"]
+                .fillna("")
+                .astype(str)
+                .str.strip()
+                .drop_duplicates()
+                .tolist()
+                if value
+            ]
+            legend_label = " / ".join(item_types[:4]) or "Other schedule item"
+            if len(item_types) > 4:
+                legend_label += f" +{len(item_types) - 4} more"
+            fig.add_trace(
+                go.Bar(
+                    x=[None],
+                    y=[None],
+                    marker={"color": color},
+                    name=legend_label,
+                    orientation="h",
+                    showlegend=True,
+                    hoverinfo="skip",
+                )
+            )
+    else:
         field = color_mode
         categories = plot_df[field].dropna().astype(str).unique().tolist()
         if field == "Status":
@@ -1756,15 +2072,6 @@ def build_gantt(
                 )
             )
 
-        fig.update_layout(
-            legend={
-                "title": {"text": legend_title},
-                "orientation": "h",
-                "y": -0.14,
-                "x": 0,
-            }
-        )
-
     if not highlighted.empty:
         fig.add_trace(
             go.Scatter(
@@ -1777,6 +2084,18 @@ def build_gantt(
                 showlegend=True,
             )
         )
+
+    fig.update_layout(
+        legend={
+            "title": {"text": "Color legend"},
+            "orientation": "h",
+            "y": -0.20,
+            "x": 0,
+            "xanchor": "left",
+            "yanchor": "top",
+            "traceorder": "normal",
+        }
+    )
 
     return fig
 
@@ -1861,20 +2180,23 @@ else:
 
 all_editable_columns = editable_schedule_columns(master_df)
 persisted_view_settings = read_persisted_view_settings()
+default_visible_columns = [
+    column for column in all_editable_columns if column != "Color"
+]
 
 if "visible_columns_widget" not in st.session_state:
     saved_visible_columns = persisted_view_settings.get(
         "visible_columns",
-        list(all_editable_columns),
+        list(default_visible_columns),
     )
     if not isinstance(saved_visible_columns, list):
-        saved_visible_columns = list(all_editable_columns)
+        saved_visible_columns = list(default_visible_columns)
 
     st.session_state.visible_columns_widget = [
         column
         for column in saved_visible_columns
         if column in all_editable_columns
-    ] or list(all_editable_columns)
+    ] or list(default_visible_columns)
 else:
     st.session_state.visible_columns_widget = [
         column
@@ -1896,6 +2218,73 @@ with status_col:
 # -----------------------------------------------------------------------------
 with st.sidebar:
     st.header("Data & Controls")
+
+    with st.expander("👥 Usage", expanded=False):
+        auth_key, auth_name, auth_email = authenticated_user_identity()
+        if auth_key:
+            current_user_key = auth_key
+            current_user_name = auth_name
+            current_user_email = auth_email
+            st.caption(f"Signed in as {current_user_name}")
+        else:
+            manual_name = st.text_input(
+                "Your name",
+                key="usage_manual_name",
+                placeholder="Enter name for usage tracking",
+                help=(
+                    "If app authentication is not configured, this name identifies "
+                    "you in the local usage list."
+                ),
+            ).strip()
+            current_user_name = manual_name or "Anonymous user"
+            current_user_email = ""
+            current_user_key = (
+                f"manual:{manual_name.casefold()}"
+                if manual_name
+                else f"anonymous:{st.session_state.usage_session_id}"
+            )
+
+        record_user_activity(
+            st.session_state.usage_session_id,
+            current_user_key,
+            current_user_name,
+            current_user_email,
+        )
+        active_users, total_users, total_sessions = usage_summary()
+        usage_col_1, usage_col_2, usage_col_3 = st.columns(3)
+        usage_col_1.metric("Active", len(active_users))
+        usage_col_2.metric("Users", total_users)
+        usage_col_3.metric("Opens", total_sessions)
+
+        if active_users:
+            activity_rows = []
+            for user in active_users:
+                display = str(user.get("display_name", "User"))
+                email = str(user.get("email", "") or "")
+                if email and email.casefold() not in display.casefold():
+                    display = f"{display} ({email})"
+                last_active = pd.to_datetime(
+                    user.get("last_seen", ""), errors="coerce"
+                )
+                activity_rows.append(
+                    {
+                        "Active user": display,
+                        "Last active": (
+                            last_active.strftime("%d-%b %H:%M")
+                            if pd.notna(last_active)
+                            else ""
+                        ),
+                    }
+                )
+            st.dataframe(
+                pd.DataFrame(activity_rows),
+                hide_index=True,
+                use_container_width=True,
+            )
+        st.caption(
+            f"Active means activity within {ACTIVE_USER_MINUTES} minutes. "
+            "Records are stored on this app server."
+        )
 
     uploaded = st.file_uploader(
         "Upload schedule Excel or CSV",
@@ -1933,7 +2322,7 @@ with st.sidebar:
         st.session_state.source_name = "Empty schedule"
         st.session_state.source_file_name = ""
         st.session_state.schedule_snapshot_id = ""
-        st.session_state.selected_sor_target_id = ""
+        st.session_state.selected_document_item_id = ""
         st.session_state.filter_reset_token += 1
         st.session_state.pop("visible_columns_widget", None)
         st.rerun()
@@ -1959,19 +2348,24 @@ with st.sidebar:
         help="Downloads the complete current master schedule after all applied edits.",
     )
 
-    with st.expander("SoR PDF settings", expanded=False):
-        sor_folder_text = st.text_input(
-            "SoR PDF folder",
-            value=str(persisted_view_settings.get("sor_folder", "input")),
-            key="sor_folder_widget",
+    with st.expander("Linked PDF settings", expanded=False):
+        document_folder_text = st.text_input(
+            "Document PDF folder",
+            value=str(
+                persisted_view_settings.get(
+                    "document_folder",
+                    persisted_view_settings.get("sor_folder", "input"),
+                )
+            ),
+            key="document_folder_widget",
             help=(
                 "Relative paths are resolved beside the Python file. "
                 "Example: input. An absolute local path also works when running locally."
             ),
         )
 
-        uploaded_sor_documents = st.file_uploader(
-            "Upload SoR PDFs for this session",
+        uploaded_documents = st.file_uploader(
+            "Upload linked PDFs for this session",
             type=["pdf"],
             accept_multiple_files=True,
             help=(
@@ -1979,20 +2373,20 @@ with st.sidebar:
                 "for the current app session."
             ),
         )
-        for pdf_file in uploaded_sor_documents:
-            st.session_state.uploaded_sor_files[pdf_file.name] = pdf_file.getvalue()
+        for pdf_file in uploaded_documents:
+            st.session_state.uploaded_document_files[pdf_file.name] = pdf_file.getvalue()
 
         st.caption(
-            f"Session PDFs: {len(st.session_state.uploaded_sor_files)} • "
-            f"Folder: {resolve_sor_directory(sor_folder_text)}"
+            f"Session PDFs: {len(st.session_state.uploaded_document_files)} • "
+            f"Folder: {resolve_document_directory(document_folder_text)}"
         )
 
         if st.button(
-            "Clear uploaded SoR PDFs",
+            "Clear uploaded PDFs",
             use_container_width=True,
-            disabled=not st.session_state.uploaded_sor_files,
+            disabled=not st.session_state.uploaded_document_files,
         ):
-            st.session_state.uploaded_sor_files = {}
+            st.session_state.uploaded_document_files = {}
             st.rerun()
 
     st.divider()
@@ -2026,7 +2420,7 @@ with st.sidebar:
         "Search all fields",
         value=str(persisted_view_settings.get("search", "")),
         key=f"search_{reset_token}",
-        placeholder="Well, target, owner, note...",
+        placeholder="Well, event, item ID, owner, note...",
     )
     reservoirs = st.multiselect(
         "Reservoir",
@@ -2109,7 +2503,7 @@ with st.sidebar:
         key=f"owner_{reset_token}",
     )
     include_cancelled = st.checkbox(
-        "Include cancelled targets",
+        "Include cancelled items",
         value=safe_bool(
             persisted_view_settings,
             "include_cancelled",
@@ -2208,9 +2602,9 @@ with st.sidebar:
         ),
         key="gantt_type_widget",
         help=(
-            "Detailed gives one row per target. Compact merges all visible "
-            "targets sharing the selected Y-axis value onto one lane. "
-            "Grouped keeps one row per target."
+            "Detailed gives one row per item. Compact merges all visible "
+            "items sharing the selected Y-axis value onto one lane. "
+            "Grouped keeps one row per item."
         ),
     )
 
@@ -2278,10 +2672,10 @@ with st.sidebar:
     )
 
     label_mode_options = [
-        "Target ID + well",
-        "Well name",
-        "Rig + well",
-        "Target ID",
+        "Item ID + name",
+        "Item / event name",
+        "Rig + name",
+        "Item ID",
     ]
     label_mode = st.selectbox(
         "Target label format",
@@ -2295,8 +2689,8 @@ with st.sidebar:
     )
 
     bar_text_options = [
-        "Target name + progress %",
-        "Target name only",
+        "Item name + progress %",
+        "Item name only",
         "Progress % only",
         "No text",
     ]
@@ -2310,7 +2704,7 @@ with st.sidebar:
         ),
         key="bar_text_mode_widget",
         help=(
-            "The target name is drawn above progress shading and remains visible."
+            "The item name is drawn above progress shading and remains visible."
         ),
     )
 
@@ -2371,7 +2765,7 @@ with st.sidebar:
         owners=owners,
         include_cancelled=include_cancelled,
         date_window=date_window,
-        sor_folder_text=sor_folder_text,
+        document_folder_text=document_folder_text,
         gantt_type=gantt_type,
         y_axis_column=y_axis_column,
         color_mode=color_mode,
@@ -2524,7 +2918,7 @@ rig_util_df = calculate_rig_utilization(filtered_df, date_window)
 # KPIs
 # -----------------------------------------------------------------------------
 k1, k2, k3, k4, k5, k6 = st.columns(6)
-k1.metric("Visible targets", f"{len(filtered_df):,}", delta=f"of {len(master_df):,} total")
+k1.metric("Visible items", f"{len(filtered_df):,}", delta=f"of {len(master_df):,} total")
 k2.metric("Active rigs", f"{filtered_df['Rig'].nunique():,}")
 k3.metric("Scheduled days", f"{int(filtered_df['Duration_Days'].fillna(0).sum()):,}")
 k4.metric("Average progress", f"{filtered_df['Progress_Pct'].mean() if len(filtered_df) else 0:.0f}%")
@@ -2571,50 +2965,52 @@ with tab_gantt:
             },
         },
     )
+    enable_zoom_aware_tooltips(base_font_size=13)
 
-    clicked_target_id = extract_selected_target_id(gantt_event)
-    if clicked_target_id:
-        st.session_state.selected_sor_target_id = clicked_target_id
+    clicked_item_id = extract_selected_target_id(gantt_event)
+    if clicked_item_id:
+        st.session_state.selected_document_item_id = clicked_item_id
 
     st.caption(
-        "Move the mouse over a target: the pointer changes to a hand. "
-        "Click the bar, progress section or target text to open the matching SoR PDF."
+        "Move the mouse over an item: the pointer changes to a hand. "
+        "Click the bar, progress section or item text to open its linked PDF."
     )
 
-    selected_target_id = st.session_state.get("selected_sor_target_id", "")
-    if selected_target_id:
+    selected_item_id = st.session_state.get("selected_document_item_id", "")
+    if selected_item_id:
         selected_rows = master_df[
-            master_df["Target_ID"].astype(str) == str(selected_target_id)
+            master_df["Target_ID"].astype(str) == str(selected_item_id)
         ]
 
         if selected_rows.empty:
-            st.warning(f"Selected target {selected_target_id} is not in the current schedule.")
+            st.warning(f"Selected item {selected_item_id} is not in the current schedule.")
         else:
             selected_row = selected_rows.iloc[0]
-            document = resolve_sor_document(
+            document = resolve_document(
                 selected_row,
-                resolve_sor_directory(sor_folder_text),
-                st.session_state.uploaded_sor_files,
+                resolve_document_directory(document_folder_text),
+                st.session_state.uploaded_document_files,
             )
+            document_name = document_display_name(selected_row, document)
 
             st.markdown("---")
-            sor_title_col, sor_close_col = st.columns([5, 1])
-            sor_title_col.subheader(
-                f"SoR — {selected_row['Target_ID']} | "
+            document_title_col, document_close_col = st.columns([5, 1])
+            document_title_col.subheader(
+                f"{document_name} — {selected_row['Target_ID']} | "
                 f"{selected_row['Well_Name']}"
             )
-            if sor_close_col.button(
-                "Close SoR",
+            if document_close_col.button(
+                "Close document",
                 use_container_width=True,
-                key=f"close_sor_{selected_target_id}",
+                key=f"close_document_{selected_item_id}",
             ):
-                st.session_state.selected_sor_target_id = ""
+                st.session_state.selected_document_item_id = ""
                 st.session_state.gantt_selection_token += 1
                 st.rerun()
 
             if document is None:
                 expected_name = str(
-                    selected_row.get("SoR_File", "") or ""
+                    selected_row.get("Document_File", "") or ""
                 ).strip()
                 detail = (
                     f" Expected file: `{expected_name}`."
@@ -2622,14 +3018,14 @@ with tab_gantt:
                     else ""
                 )
                 st.warning(
-                    f"SoR not found for {selected_target_id}.{detail}"
+                    f"No linked PDF was found for {selected_item_id}.{detail}"
                 )
                 st.caption(
                     "Add the PDF to the configured input folder, upload it "
-                    "from the sidebar, or populate the SoR_File column."
+                    "from the sidebar, or populate the Document_File column."
                 )
             else:
-                show_pdf_viewer(document, selected_target_id)
+                show_pdf_viewer(document, selected_item_id, document_name)
 
 with tab_edit:
     st.subheader("Editable filtered schedule")
@@ -2641,7 +3037,7 @@ with tab_edit:
     if master_df.empty:
         st.info(
             "The schedule is currently empty. Upload an Excel/CSV file from the "
-            "sidebar, add a target from Bulk Actions, or create the first blank row."
+            "sidebar, add an item from Bulk Actions, or create the first blank row."
         )
 
         first_row_col, template_col = st.columns([1, 1])
@@ -2669,7 +3065,8 @@ with tab_edit:
                 "Color": DEFAULT_COLOR,
                 "Highlight": False,
                 "Highlight_Label": "",
-                "SoR_File": "",
+                "Document_Name": "",
+                "Document_File": "",
                 "Notes": "",
             }
             set_master(pd.DataFrame([first_row]), add_undo=True)
@@ -2720,6 +3117,49 @@ with tab_edit:
                 disabled=False,
             )
 
+    if not master_df.empty:
+        with st.expander("🎨 Visual bar color editor", expanded=False):
+            color_label_lookup = {
+                str(row["Target_ID"]): (
+                    f"{row['Target_ID']} | {row['Well_Name']} | {row['Target_Type']}"
+                )
+                for _, row in master_df.iterrows()
+            }
+            color_item_id = st.selectbox(
+                "Schedule item",
+                options=master_df["Target_ID"].astype(str).tolist(),
+                format_func=lambda item: color_label_lookup.get(str(item), str(item)),
+                key="visual_color_item_id",
+            )
+            current_color = valid_hex_color(
+                master_df.loc[
+                    master_df["Target_ID"].astype(str) == str(color_item_id),
+                    "Color",
+                ].iloc[0]
+            )
+            picked_color = st.color_picker(
+                "Choose bar color",
+                value=current_color,
+                key=f"visual_color_picker_{normalized_document_key(color_item_id)}",
+            )
+            if st.button(
+                "Apply selected color",
+                use_container_width=True,
+                key="apply_visual_item_color",
+            ):
+                updated = master_df.copy()
+                updated.loc[
+                    updated["Target_ID"].astype(str) == str(color_item_id),
+                    "Color",
+                ] = picked_color
+                set_master(updated, add_undo=True)
+                st.success(f"Color updated for {color_item_id}.")
+                st.rerun()
+            st.caption(
+                "Use this picker instead of typing a color code. For several "
+                "items at once, use Bulk Actions."
+            )
+
     apply_col, input_col, package_col, local_col = st.columns(4)
 
     can_apply = (
@@ -2742,7 +3182,7 @@ with tab_edit:
                 visible_editor_columns,
             )
             set_master(updated, add_undo=True)
-            st.session_state.source_name = "Edited in NWD Scheduler v1.6.1"
+            st.session_state.source_name = "Edited in NWD Scheduler v1.7.0"
             st.success("Edits applied to the complete master schedule.")
             st.rerun()
         except Exception as exc:
@@ -2772,7 +3212,7 @@ with tab_edit:
         "⬇ CSV package",
         data=current_export,
         file_name=(
-            f"NWD_Scheduler_v1.5.1_"
+            f"NWD_Scheduler_v1.7.0_"
             f"{datetime.now():%Y%m%d_%H%M}.zip"
         ),
         mime="application/zip",
@@ -2797,17 +3237,22 @@ with tab_actions:
     left, right = st.columns(2)
 
     with left:
-        st.subheader("Add a new target")
+        st.subheader("Add a new schedule item")
         with st.form("add_target_form", clear_on_submit=True):
             a1, a2 = st.columns(2)
-            well_name = a1.text_input("Well name", placeholder="R-1501")
-            target_id = a2.text_input("Target ID (optional)", placeholder="Auto-generated")
+            well_name = a1.text_input("Well / event name", placeholder="R-1501 or Rig Maintenance")
+            target_id = a2.text_input("Item / event ID (optional)", placeholder="Auto-generated")
             reservoir = a1.selectbox("Reservoir", sorted(set(RESERVOIR_OPTIONS + select_options(master_df, "Reservoir"))))
             area = a2.selectbox("Area", sorted(set(AREA_OPTIONS + select_options(master_df, "Area"))))
             rig = a1.selectbox("Rig", sorted(set(select_options(master_df, "Rig") + ["Unassigned"])))
             pad = a2.text_input("Pad / cluster")
-            target_type = a1.selectbox("Target type", TARGET_TYPE_OPTIONS)
+            target_type = a1.selectbox("Item type", TARGET_TYPE_OPTIONS)
             priority = a2.selectbox("Priority", PRIORITY_OPTIONS, index=2)
+            custom_item_type = st.text_input(
+                "Custom item type (optional)",
+                value="",
+                placeholder="Enter any event type not listed above",
+            )
             start_date = a1.date_input("Start date", value=max(date.today(), min_date))
             planned_days = a2.number_input("Planned duration (days)", min_value=1, max_value=365, value=45, step=1)
             status = a1.selectbox("Status", STATUS_OPTIONS, index=0)
@@ -2825,24 +3270,29 @@ with tab_actions:
                 value="",
                 placeholder="New Technology",
             )
-            sor_file = a2.text_input(
-                "SoR PDF filename",
+            document_name = a2.text_input(
+                "Document name",
+                value="",
+                placeholder="SoR, WCS, ToR, or custom name",
+            )
+            document_file = st.text_input(
+                "Document PDF filename",
                 value="",
                 placeholder="NWD-001_SoR.pdf",
             )
             notes = st.text_area("Notes")
-            submitted = st.form_submit_button("Add target", type="primary", use_container_width=True)
+            submitted = st.form_submit_button("Add item", type="primary", use_container_width=True)
 
         if submitted:
             new_id = target_id.strip() or next_target_id(master_df["Target_ID"].tolist())
             new_row = {
                 "Target_ID": new_id,
-                "Well_Name": well_name.strip() or f"New-Well-{len(master_df)+1}",
+                "Well_Name": well_name.strip() or f"New-Item-{len(master_df)+1}",
                 "Reservoir": reservoir,
                 "Area": area,
                 "Pad": pad,
                 "Rig": rig,
-                "Target_Type": target_type,
+                "Target_Type": custom_item_type.strip() or target_type,
                 "Start_Date": pd.Timestamp(start_date),
                 "End_Date": pd.Timestamp(start_date) + pd.Timedelta(days=int(planned_days) - 1),
                 "Status": status,
@@ -2853,7 +3303,8 @@ with tab_actions:
                 "Color": color,
                 "Highlight": bool(highlight),
                 "Highlight_Label": highlight_label,
-                "SoR_File": sor_file,
+                "Document_Name": document_name,
+                "Document_File": document_file,
                 "Notes": notes,
             }
             set_master(pd.concat([master_df, pd.DataFrame([new_row])], ignore_index=True), add_undo=True)
@@ -2862,8 +3313,8 @@ with tab_actions:
             st.rerun()
 
     with right:
-        st.subheader("Selected-target actions")
-        selected_ids = st.multiselect("Choose target(s)", master_df["Target_ID"].tolist(), help="Actions below apply to these targets.")
+        st.subheader("Selected-item actions")
+        selected_ids = st.multiselect("Choose item(s)", master_df["Target_ID"].tolist(), help="Actions below apply to these schedule items.")
 
         c1, c2 = st.columns(2)
         if c1.button("Duplicate first selected", use_container_width=True, disabled=not selected_ids):
@@ -2877,7 +3328,7 @@ with tab_actions:
 
         if c2.button("🗑 Delete selected", use_container_width=True, disabled=not selected_ids):
             set_master(master_df[~master_df["Target_ID"].isin(selected_ids)], add_undo=True)
-            st.success(f"Deleted {len(selected_ids)} target(s)")
+            st.success(f"Deleted {len(selected_ids)} item(s)")
             st.rerun()
 
         st.markdown("#### Shift dates")
@@ -2892,7 +3343,7 @@ with tab_actions:
 
         st.markdown("#### Set exact dates")
         exact_start = st.date_input("New start date", value=date.today(), key="bulk_exact_start")
-        preserve_duration = st.checkbox("Preserve each target's duration", value=True)
+        preserve_duration = st.checkbox("Preserve each item's duration", value=True)
         exact_end = st.date_input("New end date", value=date.today() + timedelta(days=44), disabled=preserve_duration, key="bulk_exact_end")
         if st.button("Apply exact dates", use_container_width=True, disabled=not selected_ids):
             updated = master_df.copy()
@@ -2907,7 +3358,7 @@ with tab_actions:
         bulk_status = st.selectbox("New status", ["— Keep current —"] + STATUS_OPTIONS)
         bulk_priority = st.selectbox("New priority", ["— Keep current —"] + PRIORITY_OPTIONS)
         bulk_rig = st.selectbox("New rig", ["— Keep current —"] + sorted(set(select_options(master_df, "Rig") + ["Unassigned"])))
-        bulk_color = st.color_picker("New custom color", value=DEFAULT_COLOR)
+        bulk_color = st.color_picker("Pick bar color", value=DEFAULT_COLOR)
         change_color = st.checkbox("Apply the selected color", value=False)
         bulk_highlight = st.selectbox(
             "Highlight border",
@@ -2997,7 +3448,7 @@ with tab_summary:
 with tab_help:
     st.markdown(
         """
-        ### NWD Scheduler v1.6.1 workflow
+        ### NWD Scheduler v1.7.0 workflow
         1. The application opens with an **empty schedule**.
         2. Upload an Excel/CSV schedule or add items manually.
         3. Choose visible columns under **Table & tooltip columns**. Hidden table
@@ -3006,9 +3457,11 @@ with tab_help:
            It receives a purple dashed Gantt border.
         5. Apply edits and download **Updated input** to preserve the complete
            amended master schedule.
-        6. Put SoR PDFs in the `input` folder beside the Python file, upload PDFs
-           temporarily from the sidebar, and optionally populate `SoR_File`.
-        7. Click a Gantt target to open its matching SoR PDF. The mouse pointer
+        6. Put linked PDFs in the `input` folder beside the Python file, upload PDFs
+           temporarily from the sidebar, and populate `Document_File` when possible.
+        7. Set `Document_Name` to any user-defined label, such as **SoR**, **WCS**,
+           **ToR**, or another document name. Click a Gantt item to open its PDF.
+           The item may be a well target or any other schedule event. The mouse pointer
            changes to a hand over clickable chart items.
         8. Use **Save / load view template** to download a portable JSON file.
            It contains the complete current schedule plus all filters and chart settings.
@@ -3017,10 +3470,25 @@ with tab_help:
         10. Use **Reset defaults** to clear filters and chart settings while keeping
             the current schedule loaded.
 
-        ### SoR filename matching
-        The most reliable method is to populate `SoR_File`, for example
-        `R-1501_SoR.pdf`. If it is blank, the app searches PDF filenames using
-        `Target_ID` and `Well_Name`.
+        ### Linked-document filename matching
+        The most reliable method is to populate `Document_File`, for example
+        `R-1501_SoR.pdf`, and enter the preferred display label in `Document_Name`.
+        If `Document_File` is blank, the app searches PDF filenames using the item ID
+        and well/event name. Existing inputs containing `SoR_File` remain compatible
+        and are automatically treated as `Document_File` with the name **SoR**.
+
+        ### Colors and legend
+        The Gantt always shows a **Color legend** underneath the chart. In custom-color
+        mode, the legend groups the visible item types by the colors actually used.
+        Use the visual color picker below the editable table for one item, or use
+        **Bulk Actions** for several items; typing hex codes is not required.
+
+        ### Usage panel
+        The **Usage** panel shows active users, total known users and opened sessions.
+        If Streamlit authentication is configured, it uses the signed-in identity;
+        otherwise each user can enter a display name. The lightweight database is local
+        to the running app server, so redeployment or an ephemeral cloud restart can
+        clear the history.
 
         ### Streamlit Cloud
         A browser cannot automatically reopen the original CSV path on your
@@ -3040,4 +3508,4 @@ with tab_help:
     )
 
 st.divider()
-st.caption("NWD Scheduler v1.6.1 • Empty start • Highlighted technology items • Dynamic tooltips • Click-to-open SoR")
+st.caption("NWD Scheduler v1.7.0 • Generic linked PDFs • Zoom-aware tooltips • Color legend • Usage visibility")
