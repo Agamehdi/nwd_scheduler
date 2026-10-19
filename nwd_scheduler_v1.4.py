@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-NWD Scheduler v1.7.0 - Streamlit application
+NWD Scheduler v1.8 - Streamlit application
 
 Run:
-    streamlit run NWD_Scheduler_v1.7.0.py
+    streamlit run NWD_Scheduler_v1.8_BP_Converter.py
 
 The application opens with an empty schedule. Upload an Excel/CSV schedule
 when required. Place linked PDF documents in an "input" folder beside this
@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import base64
 import gzip
+import getpass
 import html
 import io
 import json
@@ -55,7 +56,8 @@ HIGHLIGHT_COLOR = "#7C3AED"
 SCHEDULE_STATE_DIR = Path.home() / ".nwd_scheduler_state"
 SCHEDULE_SNAPSHOT_PATTERN = re.compile(r"^[a-f0-9]{32}$")
 USAGE_DB_PATH = SCHEDULE_STATE_DIR / "usage.sqlite3"
-ACTIVE_USER_MINUTES = 15
+HEARTBEAT_SECONDS = 20
+ACTIVE_USER_SECONDS = 65
 
 REQUIRED_COLUMNS = [
     "Target_ID",
@@ -369,6 +371,257 @@ def normalize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     return df.reset_index(drop=True)
 
 
+
+# -----------------------------------------------------------------------------
+# BP P10 (Primavera hierarchy) -> SOCAR / NWD schedule converter
+# -----------------------------------------------------------------------------
+BP_P10_COLUMNS = {"activity id", "at completion duration", "start", "finish"}
+BP_ROOT_AREA_CODES = {
+    "CA Platform": "CA",
+    "WA Platform": "WA",
+    "EA Platform": "EA",
+    "ACE Platform": "ACE",
+    "DWG Platform": "DWG",
+    "Chirag Platform": "CHI",
+    "West Chirag Platform": "WCH",
+    "Shah Deniz Alpha Platform": "SDA",
+    "Shah Deniz Pre Fasila - 15k MODU": "SDPF",
+    "Istiglal": "IST",
+}
+
+
+def is_bp_p10_sheet(frame: pd.DataFrame) -> bool:
+    """Identify BP's four-column, hierarchy-based Primavera P10 export."""
+    normalized = {str(col).strip().casefold() for col in frame.columns}
+    return BP_P10_COLUMNS.issubset(normalized)
+
+
+def parse_bp_p10_date(raw: object) -> Tuple[pd.Timestamp, bool]:
+    """Read true Excel dates, Excel day serials and strings such as '01-Jan-26 A'."""
+    if raw is None or (not isinstance(raw, str) and pd.isna(raw)):
+        return pd.NaT, False
+    if isinstance(raw, (datetime, date, pd.Timestamp)):
+        return pd.Timestamp(raw).normalize(), False
+    if isinstance(raw, (int, float, np.integer, np.floating)):
+        if not np.isfinite(float(raw)) or not 20000 <= float(raw) <= 90000:
+            return pd.NaT, False
+        return pd.to_datetime(float(raw), unit="D", origin="1899-12-30").normalize(), False
+    value = str(raw).strip().replace("\u00a0", " ")
+    actual = bool(re.search(r"\s+(?:A|Actual)\s*$", value, flags=re.IGNORECASE))
+    value = re.sub(r"\s+(?:A|Actual)\s*$", "", value, flags=re.IGNORECASE).strip()
+    if not value:
+        return pd.NaT, actual
+    if re.fullmatch(r"\d{5}(?:\.\d+)?", value):
+        try:
+            return pd.to_datetime(float(value), unit="D", origin="1899-12-30").normalize(), actual
+        except (ValueError, TypeError, OverflowError):
+            return pd.NaT, actual
+    for fmt in ("%d-%b-%y", "%d-%b-%Y", "%d/%m/%Y", "%d.%m.%Y", "%Y-%m-%d", "%m/%d/%Y"):
+        try:
+            return pd.Timestamp(datetime.strptime(value, fmt)).normalize(), actual
+        except ValueError:
+            continue
+    parsed = pd.to_datetime(value, errors="coerce", dayfirst=True)
+    return (pd.Timestamp(parsed).normalize() if pd.notna(parsed) else pd.NaT), actual
+
+
+def bp_activity_type(activity: str, branch: str) -> str:
+    """Classify only clear task types; never pretend an unknown well is a producer."""
+    description = activity.casefold()
+    if "rigless" in description and "activities" in description:
+        return "Other Event"
+    if re.search(r"\b(?:rig move|rig mobilisation|rig mobilization|rig demobil|de-mobilization|demobilization)\b", description):
+        return "Rig Move"
+    if re.search(r"\b(?:maintenance|recertification|re-certification|inspection)\b", description):
+        return "Rig Maintenance"
+    if re.search(r"\b(?:pre tar|post tar|tar \(|tar$)\b", description):
+        return "TAR"
+    if re.search(r"\b(?:standby|stand-by|warm stack|rig break)\b", description):
+        return "Other Event"
+    if re.search(r"(?:mzwi|water inject|\bwi\b|\bdhfc\b)", description):
+        return "Water Injector"
+    if re.search(r"(?:mzgi|gas inject|\bgi\b)", description):
+        return "Gas Injector"
+    if re.search(r"\b(?:de-complet|de-complet|coil tubing|cleanout|water shutoff|intervention|plt|glvco|uh rc|uhrc|add perf|valve replacement|workover)\b", description):
+        return "Intervention"
+    if re.search(r"\b(?:drill|top hole|deep hole|comp|completion|primary|ohgp)\b", description):
+        return "Drilling / Completion"
+    if re.match(r"^(?:[A-Z]{1,3}\d{1,3}[a-z]?)\b", activity):
+        return "Well Activity"
+    if "rigless" in branch.casefold():
+        return "Rigless Activities"
+    return "Other Event"
+
+
+def bp_platform_area(root: str) -> str:
+    if root in BP_ROOT_AREA_CODES:
+        return BP_ROOT_AREA_CODES[root]
+    clean = re.sub(r"\bPlatform\b", "", root, flags=re.IGNORECASE).strip()
+    return (clean or "BP").split(" ")[0][:24]
+
+
+def convert_bp_p10_to_socar(
+    source: object,
+    filename: str = "BP_P10.xlsx",
+    include_group_summaries: bool = False,
+) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, int]]:
+    """Convert a BP hierarchy to exactly the NWD/SOCAR input-column format.
+
+    Default: leaf activities only, avoiding summary/child double counting.
+    Primavera P10 uses end boundary (Finish - Start = Duration), while the
+    NWD scheduler uses inclusive End_Date. Therefore Finish is reduced by
+    one calendar day for tasks with a positive duration.
+    """
+    if isinstance(source, pd.DataFrame):
+        raw = source.copy()
+    else:
+        excel = pd.ExcelFile(source)
+        preferred = None
+        raw = None
+        for sheet_name in excel.sheet_names:
+            candidate = pd.read_excel(excel, sheet_name=sheet_name, dtype=object)
+            if is_bp_p10_sheet(candidate):
+                raw = candidate
+                preferred = sheet_name
+                break
+        if raw is None:
+            raise ValueError(
+                "BP P10 sheet not found. Expected columns: Activity ID, "
+                "At Completion Duration, Start, Finish."
+            )
+    if not is_bp_p10_sheet(raw):
+        raise ValueError("This is not a BP P10 workbook (expected Primavera 4-column header).")
+
+    columns = {str(c).strip().casefold(): c for c in raw.columns}
+    activity_col = columns["activity id"]
+    duration_col = columns["at completion duration"]
+    start_col = columns["start"]
+    finish_col = columns["finish"]
+    name = Path(str(filename)).stem
+    title = re.sub(r"_schedule.*$", "", name, flags=re.IGNORECASE).replace("_", " ").strip()
+    campaign = ("BP " + title) if not title.casefold().startswith("bp") else title
+    if not campaign:
+        campaign = "BP P10"
+
+    entries: List[Dict[str, object]] = []
+    path: List[Tuple[int, str]] = []
+    for frame_index, row in raw.iterrows():
+        original = row.get(activity_col)
+        if original is None or pd.isna(original):
+            continue
+        line = str(original).replace("\u00a0", " ").expandtabs(2)
+        label = line.strip()
+        if not label:
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        while path and path[-1][0] >= indent:
+            path.pop()
+        parents = [ancestor_name for _, ancestor_name in path]
+        root = parents[0] if parents else label
+        workstream = parents[-1] if parents else ""
+        entries.append({
+            "source_row": int(frame_index) + 2,
+            "name": label,
+            "indent": indent,
+            "parents": parents,
+            "root": root,
+            "branch": workstream,
+            "duration": row.get(duration_col),
+            "start": row.get(start_col),
+            "finish": row.get(finish_col),
+        })
+        path.append((indent, label))
+
+    records: List[Dict[str, object]] = []
+    diagnostics: List[Dict[str, object]] = []
+    counts = {"Source rows": len(entries), "Summary groups excluded": 0,
+              "Invalid date rows skipped": 0, "Duration mismatches": 0,
+              "Converted activities": 0}
+    for index, activity in enumerate(entries):
+        is_summary = (
+            index + 1 < len(entries)
+            and entries[index + 1]["indent"] > activity["indent"]
+        )
+        if is_summary and not include_group_summaries:
+            counts["Summary groups excluded"] += 1
+            continue
+        start, actual_start = parse_bp_p10_date(activity["start"])
+        finish, actual_finish = parse_bp_p10_date(activity["finish"])
+        if pd.isna(start) or pd.isna(finish) or finish < start:
+            diagnostics.append({"Source_Row": activity["source_row"],
+                                "Activity": activity["name"],
+                                "Issue": "Invalid/missing start or finish date"})
+            counts["Invalid date rows skipped"] += 1
+            continue
+        # P10 schedules represent Finish as a boundary, not the last full workday.
+        inclusive_end = finish - pd.Timedelta(days=1) if finish > start else finish
+        calculated_days = (inclusive_end - start).days + 1
+        reported_duration = pd.to_numeric(activity["duration"], errors="coerce")
+        if pd.notna(reported_duration) and abs(calculated_days - float(reported_duration)) > 0.01:
+            counts["Duration mismatches"] += 1
+            diagnostics.append({"Source_Row": activity["source_row"],
+                                "Activity": activity["name"],
+                                "Issue": f"P10 duration {reported_duration:g}d vs calendar {calculated_days}d"})
+        root = str(activity["root"])
+        branch = str(activity["branch"])
+        area = bp_platform_area(root)
+        if "rigless" in activity["name"].casefold() or "rigless" in branch.casefold():
+            # Rigless workstreams can overlap legitimately; keep their lanes
+            # separate to avoid reporting false same-rig clashes.
+            label_lower = activity["name"].casefold()
+            if "simops" in label_lower:
+                resource = f"{area} Rigless - SIMOPS"
+            elif "non drilling" in label_lower:
+                resource = f"{area} Rigless - Non Drilling"
+            elif "3rd party" in label_lower:
+                resource = f"{area} Rigless - Vendor"
+            else:
+                resource = f"{area} Rigless"
+        elif "vessel" in branch.casefold():
+            resource = f"{area} Vessel"
+        else:
+            # BP P10 export has NO dedicated Rig column. Use the platform or
+            # named MODU as a resource lane; do not fabricate a rig number.
+            resource = root
+        state = "Completed" if actual_finish else "In Progress" if actual_start else "Not Started"
+        original_duration = (f"{float(reported_duration):g}" if pd.notna(reported_duration) else "")
+        context = " > ".join(activity["parents"])
+        note = (
+            f"BP P10 row {activity['source_row']}; source activity: {activity['name']}; "
+            f"hierarchy: {context or root}; BP duration: {original_duration} days; "
+            f"actual start: {'Y' if actual_start else 'N'}; "
+            f"actual finish: {'Y' if actual_finish else 'N'}. "
+            "Rig is a BP resource group (not a verified rig ID). "
+            "Reservoir is not supplied in the BP P10 source."
+        )
+        records.append({
+            "Target_ID": f"BP-{int(activity['source_row']):05d}",
+            "Well_Name": activity["name"],
+            "Reservoir": "Unspecified (BP)",
+            "Area": area,
+            "Pad": root,
+            "Rig": resource,
+            "Target_Type": bp_activity_type(activity["name"], branch),
+            "Start_Date": start,
+            "End_Date": inclusive_end,
+            "Status": state,
+            "Priority": "Medium",
+            "Progress_Pct": 100 if actual_finish else 0,
+            "Owner": "",
+            "Campaign": campaign,
+            "Color": DEFAULT_COLOR,
+            "Highlight": False,
+            "Highlight_Label": "",
+            "Document_Name": "",
+            "Document_File": "",
+            "Notes": note,
+        })
+    if not records:
+        raise ValueError("No valid scheduled BP activities were found to convert.")
+    normalized = normalize_dataframe(pd.DataFrame.from_records(records))
+    counts["Converted activities"] = len(normalized)
+    return normalized, pd.DataFrame(diagnostics, columns=["Source_Row", "Activity", "Issue"]), counts
+
 def load_schedule_file(source: object, filename: str = "") -> pd.DataFrame:
     """Load the NWD schedule from Excel or CSV."""
     suffix = Path(filename).suffix.lower() if filename else ""
@@ -388,6 +641,9 @@ def load_schedule_file(source: object, filename: str = "") -> pd.DataFrame:
         excel.sheet_names[0],
     )
     df = pd.read_excel(excel, sheet_name=preferred)
+    if is_bp_p10_sheet(df):
+        converted, _, _ = convert_bp_p10_to_socar(df, filename)
+        return converted
     return normalize_dataframe(df)
 
 
@@ -413,41 +669,125 @@ def set_master(df: pd.DataFrame, add_undo: bool = True) -> None:
     st.session_state.schedule_df = new_df
 
 
-def authenticated_user_identity() -> Tuple[str, str, str]:
-    """Return a stable Streamlit-auth identity without exposing auth tokens."""
+def current_user_identity() -> Tuple[str, str, str, str]:
+    """
+    Resolve the viewer identity from login, company proxy, or local Windows.
+
+    A centrally hosted web app cannot read a remote computer's Windows username
+    directly. Microsoft/Entra authentication or trusted proxy headers provide
+    the equivalent identity. ``getpass.getuser`` is used only for localhost,
+    where the Streamlit server is running on the viewer's own computer.
+    """
+    # 1. Native Streamlit OIDC identity (Microsoft Entra, Google, etc.).
     try:
         user = getattr(st, "user", None)
-        if user is None:
-            return "", "", ""
-        if hasattr(user, "to_dict"):
+        if user is not None and hasattr(user, "to_dict"):
             values = user.to_dict()
         elif isinstance(user, dict):
             values = dict(user)
         else:
             values = {}
-        if not bool(values.get("is_logged_in", False)):
-            return "", "", ""
-
-        email = str(
-            values.get("email")
-            or values.get("preferred_username")
-            or ""
-        ).strip()
-        display_name = str(
-            values.get("name")
-            or values.get("given_name")
-            or email
-            or "Authenticated user"
-        ).strip()
-        stable_claim = str(
-            values.get("oid")
-            or values.get("sub")
-            or email
-            or display_name
-        ).strip()
-        return f"auth:{stable_claim}", display_name[:120], email[:160]
+        if bool(values.get("is_logged_in", False)):
+            email = str(
+                values.get("email")
+                or values.get("preferred_username")
+                or ""
+            ).strip()
+            display_name = str(
+                values.get("name")
+                or values.get("given_name")
+                or email
+                or "Authenticated user"
+            ).strip()
+            stable_claim = str(
+                values.get("oid")
+                or values.get("sub")
+                or email
+                or display_name
+            ).strip()
+            return (
+                f"auth:{stable_claim}",
+                display_name[:120],
+                email[:160],
+                "Microsoft / app login",
+            )
     except Exception:
-        return "", "", ""
+        pass
+
+    # 2. Identity supplied by a trusted corporate authentication proxy.
+    try:
+        context = getattr(st, "context", None)
+        raw_headers = getattr(context, "headers", {}) if context else {}
+        headers = {
+            str(key).lower(): str(value).strip()
+            for key, value in dict(raw_headers).items()
+        }
+    except Exception:
+        headers = {}
+
+    proxy_email = next(
+        (
+            headers.get(header, "")
+            for header in [
+                "x-ms-client-principal-name",
+                "x-auth-request-email",
+                "x-forwarded-email",
+                "x-forwarded-user",
+                "remote-user",
+                "x-remote-user",
+            ]
+            if headers.get(header, "")
+        ),
+        "",
+    )
+    proxy_name = next(
+        (
+            headers.get(header, "")
+            for header in [
+                "x-ms-client-principal-name",
+                "x-auth-request-preferred-username",
+                "x-forwarded-user",
+                "remote-user",
+                "x-remote-user",
+            ]
+            if headers.get(header, "")
+        ),
+        proxy_email,
+    )
+    proxy_id = (
+        headers.get("x-ms-client-principal-id", "")
+        or headers.get("x-auth-request-user", "")
+        or proxy_email
+        or proxy_name
+    )
+    if proxy_id:
+        return (
+            f"proxy:{proxy_id}",
+            proxy_name[:120],
+            proxy_email[:160],
+            "Company login",
+        )
+
+    # 3. Local execution: here the server username is the actual PC username.
+    host_header = headers.get("host", "").strip().lower()
+    if host_header.startswith("[") and "]" in host_header:
+        host = host_header[1 : host_header.index("]")]
+    else:
+        host = host_header.rsplit(":", 1)[0] if ":" in host_header else host_header
+    if host in {"localhost", "127.0.0.1", "::1"}:
+        try:
+            windows_user = str(getpass.getuser() or "").strip()
+        except Exception:
+            windows_user = ""
+        if windows_user:
+            return (
+                f"local:{windows_user.casefold()}",
+                windows_user[:120],
+                "",
+                "Windows username",
+            )
+
+    return "", "", "", ""
 
 
 def record_user_activity(
@@ -506,7 +846,7 @@ def usage_summary() -> Tuple[List[Dict[str, object]], int, int]:
         return [], 0, 0
 
     active_after = (
-        datetime.now(timezone.utc) - timedelta(minutes=ACTIVE_USER_MINUTES)
+        datetime.now(timezone.utc) - timedelta(seconds=ACTIVE_USER_SECONDS)
     ).isoformat(timespec="seconds")
     try:
         with sqlite3.connect(USAGE_DB_PATH, timeout=5) as connection:
@@ -538,6 +878,57 @@ def usage_summary() -> Tuple[List[Dict[str, object]], int, int]:
         user for user in users if str(user.get("last_seen", "")) >= active_after
     ]
     return active_users, len(users), total_sessions
+
+
+@st.fragment(run_every=HEARTBEAT_SECONDS)
+def render_live_viewers(
+    user_key: str,
+    display_name: str,
+    email: str,
+    identity_source: str,
+) -> None:
+    """Refresh the presence list while this browser tab remains open."""
+    record_user_activity(
+        st.session_state.usage_session_id,
+        user_key,
+        display_name,
+        email,
+    )
+    active_users, _, _ = usage_summary()
+
+    st.metric("Viewing now", len(active_users))
+    if not active_users:
+        st.caption("No active viewers detected.")
+        return
+
+    activity_rows = []
+    for user in active_users:
+        user_display = str(user.get("display_name", "User") or "User")
+        user_email = str(user.get("email", "") or "")
+        if user_email and user_email.casefold() not in user_display.casefold():
+            user_display = f"{user_display} ({user_email})"
+        last_active = pd.to_datetime(user.get("last_seen", ""), errors="coerce")
+        activity_rows.append(
+            {
+                "Currently viewing": user_display,
+                "Last signal": (
+                    last_active.strftime("%H:%M:%S")
+                    if pd.notna(last_active)
+                    else ""
+                ),
+            }
+        )
+
+    st.dataframe(
+        pd.DataFrame(activity_rows),
+        hide_index=True,
+        use_container_width=True,
+    )
+    st.caption(
+        f"Your identity: {display_name} · {identity_source}. "
+        f"The list refreshes every {HEARTBEAT_SECONDS} seconds; a closed tab "
+        f"disappears in about {ACTIVE_USER_SECONDS} seconds."
+    )
 
 
 
@@ -1563,29 +1954,28 @@ def show_pdf_viewer(
         key=f"download_document_{item_id}_{normalized_document_key(file_name)}",
     )
 
-    if hasattr(st, "pdf"):
-        try:
-            st.pdf(
-                pdf_bytes,
-                height=850,
-                key=f"document_pdf_{item_id}_{normalized_document_key(file_name)}",
-            )
-            return
-        except Exception:
-            pass
+    if not hasattr(st, "pdf"):
+        st.error(
+            "PDF preview requires a current Streamlit PDF installation. "
+            "In requirements.txt use `streamlit[pdf]` instead of `streamlit`."
+        )
+        return
 
-    encoded = base64.b64encode(pdf_bytes).decode("ascii")
-    components.html(
-        (
-            '<iframe '
-            f'src="data:application/pdf;base64,{encoded}" '
-            'width="100%" height="850" '
-            'style="border:1px solid rgba(128,128,128,.3);border-radius:8px;">'
-            "</iframe>"
-        ),
-        height=870,
-        scrolling=True,
-    )
+    try:
+        # Native Streamlit/PDF.js rendering is substantially more reliable than
+        # a browser iframe with a base64 data URL, which Edge/Chrome can block.
+        st.pdf(
+            io.BytesIO(pdf_bytes),
+            height=950,
+            key=f"document_pdf_{item_id}_{normalized_document_key(file_name)}",
+        )
+    except Exception as exc:
+        st.error(
+            "The PDF was found, but the preview component is unavailable. "
+            "Install the PDF extra with `streamlit[pdf]` and restart the app."
+        )
+        with st.expander("PDF preview technical detail", expanded=False):
+            st.code(f"{type(exc).__name__}: {exc}")
 
 
 def enable_zoom_aware_tooltips(base_font_size: int = 13) -> None:
@@ -1781,8 +2171,10 @@ def build_gantt(
         colors = plot_df[field].map(cmap).fillna(DEFAULT_COLOR).tolist()
     plot_df["_Bar_Color"] = colors
 
+    # Dates in SOCAR / NWD are inclusive; show the full last scheduled day.
     duration_ms = (
         (plot_df["End_Date"] - plot_df["Start_Date"]).dt.total_seconds() * 1000
+        + 86_400_000
     ).clip(lower=86_400_000)
 
     progress_text = plot_df["Progress_Pct"].astype(int).astype(str) + "%"
@@ -1803,7 +2195,7 @@ def build_gantt(
 
     text_midpoints = (
         plot_df["Start_Date"]
-        + (plot_df["End_Date"] - plot_df["Start_Date"]) / 2
+        + (plot_df["End_Date"] - plot_df["Start_Date"] + pd.Timedelta(days=1)) / 2
     )
 
     tooltip_columns = [
@@ -1910,7 +2302,7 @@ def build_gantt(
             xref="x",
             yref="y",
             x0=row["Start_Date"],
-            x1=row["End_Date"],
+            x1=row["End_Date"] + pd.Timedelta(days=1),
             y0=category_position - half_height,
             y1=category_position + half_height,
             line={
@@ -1985,7 +2377,7 @@ def build_gantt(
         bargap=0.12 if gantt_type == "Compact merged lanes" else 0.24,
         hoverlabel={"align": "left", "font": {"size": 13}},
         clickmode="event+select",
-        selectionrevision="nwd-v1.7.0",
+        selectionrevision="nwd-v1.7.1",
         margin={"l": 20, "r": 25, "t": 88, "b": 95},
         uniformtext={"mode": "hide", "minsize": 8},
         xaxis={
@@ -2219,71 +2611,38 @@ with status_col:
 with st.sidebar:
     st.header("Data & Controls")
 
-    with st.expander("👥 Usage", expanded=False):
-        auth_key, auth_name, auth_email = authenticated_user_identity()
-        if auth_key:
-            current_user_key = auth_key
-            current_user_name = auth_name
-            current_user_email = auth_email
-            st.caption(f"Signed in as {current_user_name}")
-        else:
+    with st.expander("👥 Who is viewing now?", expanded=False):
+        (
+            current_user_key,
+            current_user_name,
+            current_user_email,
+            identity_source,
+        ) = current_user_identity()
+
+        if not current_user_key:
             manual_name = st.text_input(
-                "Your name",
+                "Your display name",
                 key="usage_manual_name",
-                placeholder="Enter name for usage tracking",
+                placeholder="Company login was not detected",
                 help=(
-                    "If app authentication is not configured, this name identifies "
-                    "you in the local usage list."
+                    "A web browser does not expose the remote Windows username. "
+                    "Enter a name only when Microsoft/company login is unavailable."
                 ),
             ).strip()
-            current_user_name = manual_name or "Anonymous user"
+            current_user_name = manual_name or "Unidentified viewer"
             current_user_email = ""
             current_user_key = (
                 f"manual:{manual_name.casefold()}"
                 if manual_name
                 else f"anonymous:{st.session_state.usage_session_id}"
             )
+            identity_source = "Manual name" if manual_name else "Anonymous session"
 
-        record_user_activity(
-            st.session_state.usage_session_id,
+        render_live_viewers(
             current_user_key,
             current_user_name,
             current_user_email,
-        )
-        active_users, total_users, total_sessions = usage_summary()
-        usage_col_1, usage_col_2, usage_col_3 = st.columns(3)
-        usage_col_1.metric("Active", len(active_users))
-        usage_col_2.metric("Users", total_users)
-        usage_col_3.metric("Opens", total_sessions)
-
-        if active_users:
-            activity_rows = []
-            for user in active_users:
-                display = str(user.get("display_name", "User"))
-                email = str(user.get("email", "") or "")
-                if email and email.casefold() not in display.casefold():
-                    display = f"{display} ({email})"
-                last_active = pd.to_datetime(
-                    user.get("last_seen", ""), errors="coerce"
-                )
-                activity_rows.append(
-                    {
-                        "Active user": display,
-                        "Last active": (
-                            last_active.strftime("%d-%b %H:%M")
-                            if pd.notna(last_active)
-                            else ""
-                        ),
-                    }
-                )
-            st.dataframe(
-                pd.DataFrame(activity_rows),
-                hide_index=True,
-                use_container_width=True,
-            )
-        st.caption(
-            f"Active means activity within {ACTIVE_USER_MINUTES} minutes. "
-            "Records are stored on this app server."
+            identity_source,
         )
 
     uploaded = st.file_uploader(
@@ -2347,6 +2706,90 @@ with st.sidebar:
         use_container_width=True,
         help="Downloads the complete current master schedule after all applied edits.",
     )
+
+    with st.expander("🔄 BP → SOCAR Converter (P10)", expanded=False):
+        st.caption(
+            "Upload a BP P10 Primavera Excel export. Group headers are excluded; "
+            "scheduled activities are converted into the normal SOCAR/NWD format."
+        )
+        bp_uploaded = st.file_uploader(
+            "BP P10 Excel file",
+            type=["xlsx", "xlsm", "xls"],
+            key="bp_p10_upload",
+            help="Example: P10_July 2026_schedule_29.06.2026.xlsx",
+        )
+        bp_include_summaries = st.checkbox(
+            "Include summary groups as separate activities",
+            value=False,
+            key="bp_p10_include_summaries",
+            help="Normally leave off to prevent double counting in the Gantt.",
+        )
+        if bp_uploaded is not None:
+            try:
+                bp_converted, bp_warnings, bp_stats = convert_bp_p10_to_socar(
+                    io.BytesIO(bp_uploaded.getvalue()),
+                    filename=bp_uploaded.name,
+                    include_group_summaries=bp_include_summaries,
+                )
+                st.success(f"Ready: {len(bp_converted)} schedule activities")
+                st.caption(
+                    f"Source activities: {bp_stats['Source rows']} | "
+                    f"Summary groups excluded: {bp_stats['Summary groups excluded']} | "
+                    f"Invalid dates: {bp_stats['Invalid date rows skipped']} | "
+                    f"Duration checks: {bp_stats['Duration mismatches']} mismatches"
+                )
+                st.dataframe(
+                    bp_converted[["Well_Name", "Area", "Rig", "Target_Type", "Start_Date", "End_Date", "Status"]].head(12),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+                if not bp_warnings.empty:
+                    with st.expander(f"Conversion QC ({len(bp_warnings)} observations)"):
+                        st.dataframe(bp_warnings, use_container_width=True, hide_index=True)
+                st.caption(
+                    "BP dates: the 'A' suffix indicates actual dates. "
+                    "BP Finish is treated as an exclusive boundary (adjusted by one day for SOCAR). "
+                    "BP has no explicit reservoir or rig number, so these are not invented."
+                )
+                bp_name = safe_filename_stem(bp_uploaded.name) + "_SOCAR.csv"
+                col_bp_download, col_bp_apply = st.columns(2)
+                col_bp_download.download_button(
+                    "⬇ Download SOCAR CSV",
+                    data=dataframe_to_csv_bytes(bp_converted),
+                    file_name=bp_name,
+                    mime="text/csv",
+                    use_container_width=True,
+                    key="bp_p10_csv_download",
+                )
+                if col_bp_apply.button(
+                    "✅ Apply to Scheduler",
+                    use_container_width=True,
+                    type="primary",
+                    key="bp_p10_apply",
+                ):
+                    set_master(bp_converted, add_undo=True)
+                    st.session_state.source_name = f"{bp_uploaded.name} → SOCAR"
+                    st.session_state.source_file_name = bp_name
+                    st.session_state.schedule_snapshot_id = save_schedule_snapshot(
+                        bp_converted, bp_name
+                    )
+                    st.session_state.selected_document_item_id = ""
+                    # Only clear data-specific filters; keep user's chart choices.
+                    revised_view = read_persisted_view_settings()
+                    for filter_name in (
+                        "search", "reservoirs", "areas", "rigs", "statuses",
+                        "priorities", "target_types", "campaigns", "owners",
+                        "date_window", "include_cancelled",
+                    ):
+                        revised_view.pop(filter_name, None)
+                    revised_view["source_file_name"] = bp_name
+                    revised_view["schedule_snapshot_id"] = st.session_state.schedule_snapshot_id
+                    write_persisted_view_settings(revised_view)
+                    st.session_state.filter_reset_token += 1
+                    st.session_state.pop("visible_columns_widget", None)
+                    st.rerun()
+            except Exception as exc:
+                st.error(f"BP P10 conversion failed: {type(exc).__name__}: {exc}")
 
     with st.expander("Linked PDF settings", expanded=False):
         document_folder_text = st.text_input(
@@ -3182,7 +3625,7 @@ with tab_edit:
                 visible_editor_columns,
             )
             set_master(updated, add_undo=True)
-            st.session_state.source_name = "Edited in NWD Scheduler v1.7.0"
+            st.session_state.source_name = "Edited in NWD Scheduler v1.7.1"
             st.success("Edits applied to the complete master schedule.")
             st.rerun()
         except Exception as exc:
@@ -3212,7 +3655,7 @@ with tab_edit:
         "⬇ CSV package",
         data=current_export,
         file_name=(
-            f"NWD_Scheduler_v1.7.0_"
+            f"NWD_Scheduler_v1.7.1_"
             f"{datetime.now():%Y%m%d_%H%M}.zip"
         ),
         mime="application/zip",
@@ -3448,7 +3891,7 @@ with tab_summary:
 with tab_help:
     st.markdown(
         """
-        ### NWD Scheduler v1.7.0 workflow
+        ### NWD Scheduler v1.7.1 workflow
         1. The application opens with an **empty schedule**.
         2. Upload an Excel/CSV schedule or add items manually.
         3. Choose visible columns under **Table & tooltip columns**. Hidden table
@@ -3470,6 +3913,17 @@ with tab_help:
         10. Use **Reset defaults** to clear filters and chart settings while keeping
             the current schedule loaded.
 
+        ### BP → SOCAR P10 converter
+        Open **BP → SOCAR Converter (P10)** in the sidebar, upload the BP P10
+        Excel workbook, review the preview and conversion QC, then select
+        **Download SOCAR CSV** or **Apply to Scheduler**. Apply replaces the
+        current master schedule (Undo is available) and refreshes the Gantt.
+        The normal schedule uploader also recognizes this BP four-column format.
+        The converted file uses the existing SOCAR/NWD CSV column format.
+        BP schedule finish boundaries are converted to inclusive end dates.
+        Hierarchical summary rows are excluded by default; rigless leaf rows
+        remain included. Unprovided reservoir and rig IDs are never guessed.
+
         ### Linked-document filename matching
         The most reliable method is to populate `Document_File`, for example
         `R-1501_SoR.pdf`, and enter the preferred display label in `Document_Name`.
@@ -3483,12 +3937,18 @@ with tab_help:
         Use the visual color picker below the editable table for one item, or use
         **Bulk Actions** for several items; typing hex codes is not required.
 
-        ### Usage panel
-        The **Usage** panel shows active users, total known users and opened sessions.
-        If Streamlit authentication is configured, it uses the signed-in identity;
-        otherwise each user can enter a display name. The lightweight database is local
-        to the running app server, so redeployment or an ephemeral cloud restart can
-        clear the history.
+        ### Who is viewing now?
+        The presence panel shows only viewers whose browser tab is currently active.
+        It sends a heartbeat every 20 seconds and removes a closed tab after about one
+        minute. Identity is detected from Streamlit/Microsoft login first, then trusted
+        corporate proxy headers. When the app runs locally, it can use the Windows
+        username. A centrally hosted browser app cannot directly read the remote PC's
+        Windows username, so a manual display-name fallback remains available.
+
+        ### PDF preview requirement
+        Use `streamlit[pdf]` in `requirements.txt`. The app uses Streamlit's native
+        PDF.js viewer instead of a base64 iframe, which avoids the blank preview seen
+        in some Edge and Chrome deployments.
 
         ### Streamlit Cloud
         A browser cannot automatically reopen the original CSV path on your
@@ -3508,4 +3968,4 @@ with tab_help:
     )
 
 st.divider()
-st.caption("NWD Scheduler v1.7.0 • Generic linked PDFs • Zoom-aware tooltips • Color legend • Usage visibility")
+st.caption("NWD Scheduler v1.8 • BP P10 Converter • Live viewers • Reliable PDF preview • Zoom-aware tooltips • Color legend")
