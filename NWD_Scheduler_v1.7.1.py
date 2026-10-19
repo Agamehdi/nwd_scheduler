@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-NWD Scheduler v1.7.1 - Streamlit application
+NWD Scheduler v1.8 - Streamlit application
 
 Run:
-    streamlit run NWD_Scheduler_v1.7.1.py
+    streamlit run NWD_Scheduler_v1.8_BP_Converter.py
 
 The application opens with an empty schedule. Upload an Excel/CSV schedule
 when required. Place linked PDF documents in an "input" folder beside this
@@ -371,6 +371,257 @@ def normalize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     return df.reset_index(drop=True)
 
 
+
+# -----------------------------------------------------------------------------
+# BP P10 (Primavera hierarchy) -> SOCAR / NWD schedule converter
+# -----------------------------------------------------------------------------
+BP_P10_COLUMNS = {"activity id", "at completion duration", "start", "finish"}
+BP_ROOT_AREA_CODES = {
+    "CA Platform": "CA",
+    "WA Platform": "WA",
+    "EA Platform": "EA",
+    "ACE Platform": "ACE",
+    "DWG Platform": "DWG",
+    "Chirag Platform": "CHI",
+    "West Chirag Platform": "WCH",
+    "Shah Deniz Alpha Platform": "SDA",
+    "Shah Deniz Pre Fasila - 15k MODU": "SDPF",
+    "Istiglal": "IST",
+}
+
+
+def is_bp_p10_sheet(frame: pd.DataFrame) -> bool:
+    """Identify BP's four-column, hierarchy-based Primavera P10 export."""
+    normalized = {str(col).strip().casefold() for col in frame.columns}
+    return BP_P10_COLUMNS.issubset(normalized)
+
+
+def parse_bp_p10_date(raw: object) -> Tuple[pd.Timestamp, bool]:
+    """Read true Excel dates, Excel day serials and strings such as '01-Jan-26 A'."""
+    if raw is None or (not isinstance(raw, str) and pd.isna(raw)):
+        return pd.NaT, False
+    if isinstance(raw, (datetime, date, pd.Timestamp)):
+        return pd.Timestamp(raw).normalize(), False
+    if isinstance(raw, (int, float, np.integer, np.floating)):
+        if not np.isfinite(float(raw)) or not 20000 <= float(raw) <= 90000:
+            return pd.NaT, False
+        return pd.to_datetime(float(raw), unit="D", origin="1899-12-30").normalize(), False
+    value = str(raw).strip().replace("\u00a0", " ")
+    actual = bool(re.search(r"\s+(?:A|Actual)\s*$", value, flags=re.IGNORECASE))
+    value = re.sub(r"\s+(?:A|Actual)\s*$", "", value, flags=re.IGNORECASE).strip()
+    if not value:
+        return pd.NaT, actual
+    if re.fullmatch(r"\d{5}(?:\.\d+)?", value):
+        try:
+            return pd.to_datetime(float(value), unit="D", origin="1899-12-30").normalize(), actual
+        except (ValueError, TypeError, OverflowError):
+            return pd.NaT, actual
+    for fmt in ("%d-%b-%y", "%d-%b-%Y", "%d/%m/%Y", "%d.%m.%Y", "%Y-%m-%d", "%m/%d/%Y"):
+        try:
+            return pd.Timestamp(datetime.strptime(value, fmt)).normalize(), actual
+        except ValueError:
+            continue
+    parsed = pd.to_datetime(value, errors="coerce", dayfirst=True)
+    return (pd.Timestamp(parsed).normalize() if pd.notna(parsed) else pd.NaT), actual
+
+
+def bp_activity_type(activity: str, branch: str) -> str:
+    """Classify only clear task types; never pretend an unknown well is a producer."""
+    description = activity.casefold()
+    if "rigless" in description and "activities" in description:
+        return "Other Event"
+    if re.search(r"\b(?:rig move|rig mobilisation|rig mobilization|rig demobil|de-mobilization|demobilization)\b", description):
+        return "Rig Move"
+    if re.search(r"\b(?:maintenance|recertification|re-certification|inspection)\b", description):
+        return "Rig Maintenance"
+    if re.search(r"\b(?:pre tar|post tar|tar \(|tar$)\b", description):
+        return "TAR"
+    if re.search(r"\b(?:standby|stand-by|warm stack|rig break)\b", description):
+        return "Other Event"
+    if re.search(r"(?:mzwi|water inject|\bwi\b|\bdhfc\b)", description):
+        return "Water Injector"
+    if re.search(r"(?:mzgi|gas inject|\bgi\b)", description):
+        return "Gas Injector"
+    if re.search(r"\b(?:de-complet|de-complet|coil tubing|cleanout|water shutoff|intervention|plt|glvco|uh rc|uhrc|add perf|valve replacement|workover)\b", description):
+        return "Intervention"
+    if re.search(r"\b(?:drill|top hole|deep hole|comp|completion|primary|ohgp)\b", description):
+        return "Drilling / Completion"
+    if re.match(r"^(?:[A-Z]{1,3}\d{1,3}[a-z]?)\b", activity):
+        return "Well Activity"
+    if "rigless" in branch.casefold():
+        return "Rigless Activities"
+    return "Other Event"
+
+
+def bp_platform_area(root: str) -> str:
+    if root in BP_ROOT_AREA_CODES:
+        return BP_ROOT_AREA_CODES[root]
+    clean = re.sub(r"\bPlatform\b", "", root, flags=re.IGNORECASE).strip()
+    return (clean or "BP").split(" ")[0][:24]
+
+
+def convert_bp_p10_to_socar(
+    source: object,
+    filename: str = "BP_P10.xlsx",
+    include_group_summaries: bool = False,
+) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, int]]:
+    """Convert a BP hierarchy to exactly the NWD/SOCAR input-column format.
+
+    Default: leaf activities only, avoiding summary/child double counting.
+    Primavera P10 uses end boundary (Finish - Start = Duration), while the
+    NWD scheduler uses inclusive End_Date. Therefore Finish is reduced by
+    one calendar day for tasks with a positive duration.
+    """
+    if isinstance(source, pd.DataFrame):
+        raw = source.copy()
+    else:
+        excel = pd.ExcelFile(source)
+        preferred = None
+        raw = None
+        for sheet_name in excel.sheet_names:
+            candidate = pd.read_excel(excel, sheet_name=sheet_name, dtype=object)
+            if is_bp_p10_sheet(candidate):
+                raw = candidate
+                preferred = sheet_name
+                break
+        if raw is None:
+            raise ValueError(
+                "BP P10 sheet not found. Expected columns: Activity ID, "
+                "At Completion Duration, Start, Finish."
+            )
+    if not is_bp_p10_sheet(raw):
+        raise ValueError("This is not a BP P10 workbook (expected Primavera 4-column header).")
+
+    columns = {str(c).strip().casefold(): c for c in raw.columns}
+    activity_col = columns["activity id"]
+    duration_col = columns["at completion duration"]
+    start_col = columns["start"]
+    finish_col = columns["finish"]
+    name = Path(str(filename)).stem
+    title = re.sub(r"_schedule.*$", "", name, flags=re.IGNORECASE).replace("_", " ").strip()
+    campaign = ("BP " + title) if not title.casefold().startswith("bp") else title
+    if not campaign:
+        campaign = "BP P10"
+
+    entries: List[Dict[str, object]] = []
+    path: List[Tuple[int, str]] = []
+    for frame_index, row in raw.iterrows():
+        original = row.get(activity_col)
+        if original is None or pd.isna(original):
+            continue
+        line = str(original).replace("\u00a0", " ").expandtabs(2)
+        label = line.strip()
+        if not label:
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        while path and path[-1][0] >= indent:
+            path.pop()
+        parents = [ancestor_name for _, ancestor_name in path]
+        root = parents[0] if parents else label
+        workstream = parents[-1] if parents else ""
+        entries.append({
+            "source_row": int(frame_index) + 2,
+            "name": label,
+            "indent": indent,
+            "parents": parents,
+            "root": root,
+            "branch": workstream,
+            "duration": row.get(duration_col),
+            "start": row.get(start_col),
+            "finish": row.get(finish_col),
+        })
+        path.append((indent, label))
+
+    records: List[Dict[str, object]] = []
+    diagnostics: List[Dict[str, object]] = []
+    counts = {"Source rows": len(entries), "Summary groups excluded": 0,
+              "Invalid date rows skipped": 0, "Duration mismatches": 0,
+              "Converted activities": 0}
+    for index, activity in enumerate(entries):
+        is_summary = (
+            index + 1 < len(entries)
+            and entries[index + 1]["indent"] > activity["indent"]
+        )
+        if is_summary and not include_group_summaries:
+            counts["Summary groups excluded"] += 1
+            continue
+        start, actual_start = parse_bp_p10_date(activity["start"])
+        finish, actual_finish = parse_bp_p10_date(activity["finish"])
+        if pd.isna(start) or pd.isna(finish) or finish < start:
+            diagnostics.append({"Source_Row": activity["source_row"],
+                                "Activity": activity["name"],
+                                "Issue": "Invalid/missing start or finish date"})
+            counts["Invalid date rows skipped"] += 1
+            continue
+        # P10 schedules represent Finish as a boundary, not the last full workday.
+        inclusive_end = finish - pd.Timedelta(days=1) if finish > start else finish
+        calculated_days = (inclusive_end - start).days + 1
+        reported_duration = pd.to_numeric(activity["duration"], errors="coerce")
+        if pd.notna(reported_duration) and abs(calculated_days - float(reported_duration)) > 0.01:
+            counts["Duration mismatches"] += 1
+            diagnostics.append({"Source_Row": activity["source_row"],
+                                "Activity": activity["name"],
+                                "Issue": f"P10 duration {reported_duration:g}d vs calendar {calculated_days}d"})
+        root = str(activity["root"])
+        branch = str(activity["branch"])
+        area = bp_platform_area(root)
+        if "rigless" in activity["name"].casefold() or "rigless" in branch.casefold():
+            # Rigless workstreams can overlap legitimately; keep their lanes
+            # separate to avoid reporting false same-rig clashes.
+            label_lower = activity["name"].casefold()
+            if "simops" in label_lower:
+                resource = f"{area} Rigless - SIMOPS"
+            elif "non drilling" in label_lower:
+                resource = f"{area} Rigless - Non Drilling"
+            elif "3rd party" in label_lower:
+                resource = f"{area} Rigless - Vendor"
+            else:
+                resource = f"{area} Rigless"
+        elif "vessel" in branch.casefold():
+            resource = f"{area} Vessel"
+        else:
+            # BP P10 export has NO dedicated Rig column. Use the platform or
+            # named MODU as a resource lane; do not fabricate a rig number.
+            resource = root
+        state = "Completed" if actual_finish else "In Progress" if actual_start else "Not Started"
+        original_duration = (f"{float(reported_duration):g}" if pd.notna(reported_duration) else "")
+        context = " > ".join(activity["parents"])
+        note = (
+            f"BP P10 row {activity['source_row']}; source activity: {activity['name']}; "
+            f"hierarchy: {context or root}; BP duration: {original_duration} days; "
+            f"actual start: {'Y' if actual_start else 'N'}; "
+            f"actual finish: {'Y' if actual_finish else 'N'}. "
+            "Rig is a BP resource group (not a verified rig ID). "
+            "Reservoir is not supplied in the BP P10 source."
+        )
+        records.append({
+            "Target_ID": f"BP-{int(activity['source_row']):05d}",
+            "Well_Name": activity["name"],
+            "Reservoir": "Unspecified (BP)",
+            "Area": area,
+            "Pad": root,
+            "Rig": resource,
+            "Target_Type": bp_activity_type(activity["name"], branch),
+            "Start_Date": start,
+            "End_Date": inclusive_end,
+            "Status": state,
+            "Priority": "Medium",
+            "Progress_Pct": 100 if actual_finish else 0,
+            "Owner": "",
+            "Campaign": campaign,
+            "Color": DEFAULT_COLOR,
+            "Highlight": False,
+            "Highlight_Label": "",
+            "Document_Name": "",
+            "Document_File": "",
+            "Notes": note,
+        })
+    if not records:
+        raise ValueError("No valid scheduled BP activities were found to convert.")
+    normalized = normalize_dataframe(pd.DataFrame.from_records(records))
+    counts["Converted activities"] = len(normalized)
+    return normalized, pd.DataFrame(diagnostics, columns=["Source_Row", "Activity", "Issue"]), counts
+
 def load_schedule_file(source: object, filename: str = "") -> pd.DataFrame:
     """Load the NWD schedule from Excel or CSV."""
     suffix = Path(filename).suffix.lower() if filename else ""
@@ -390,6 +641,9 @@ def load_schedule_file(source: object, filename: str = "") -> pd.DataFrame:
         excel.sheet_names[0],
     )
     df = pd.read_excel(excel, sheet_name=preferred)
+    if is_bp_p10_sheet(df):
+        converted, _, _ = convert_bp_p10_to_socar(df, filename)
+        return converted
     return normalize_dataframe(df)
 
 
@@ -1917,8 +2171,10 @@ def build_gantt(
         colors = plot_df[field].map(cmap).fillna(DEFAULT_COLOR).tolist()
     plot_df["_Bar_Color"] = colors
 
+    # Dates in SOCAR / NWD are inclusive; show the full last scheduled day.
     duration_ms = (
         (plot_df["End_Date"] - plot_df["Start_Date"]).dt.total_seconds() * 1000
+        + 86_400_000
     ).clip(lower=86_400_000)
 
     progress_text = plot_df["Progress_Pct"].astype(int).astype(str) + "%"
@@ -1939,7 +2195,7 @@ def build_gantt(
 
     text_midpoints = (
         plot_df["Start_Date"]
-        + (plot_df["End_Date"] - plot_df["Start_Date"]) / 2
+        + (plot_df["End_Date"] - plot_df["Start_Date"] + pd.Timedelta(days=1)) / 2
     )
 
     tooltip_columns = [
@@ -2046,7 +2302,7 @@ def build_gantt(
             xref="x",
             yref="y",
             x0=row["Start_Date"],
-            x1=row["End_Date"],
+            x1=row["End_Date"] + pd.Timedelta(days=1),
             y0=category_position - half_height,
             y1=category_position + half_height,
             line={
@@ -2450,6 +2706,90 @@ with st.sidebar:
         use_container_width=True,
         help="Downloads the complete current master schedule after all applied edits.",
     )
+
+    with st.expander("🔄 BP → SOCAR Converter (P10)", expanded=False):
+        st.caption(
+            "Upload a BP P10 Primavera Excel export. Group headers are excluded; "
+            "scheduled activities are converted into the normal SOCAR/NWD format."
+        )
+        bp_uploaded = st.file_uploader(
+            "BP P10 Excel file",
+            type=["xlsx", "xlsm", "xls"],
+            key="bp_p10_upload",
+            help="Example: P10_July 2026_schedule_29.06.2026.xlsx",
+        )
+        bp_include_summaries = st.checkbox(
+            "Include summary groups as separate activities",
+            value=False,
+            key="bp_p10_include_summaries",
+            help="Normally leave off to prevent double counting in the Gantt.",
+        )
+        if bp_uploaded is not None:
+            try:
+                bp_converted, bp_warnings, bp_stats = convert_bp_p10_to_socar(
+                    io.BytesIO(bp_uploaded.getvalue()),
+                    filename=bp_uploaded.name,
+                    include_group_summaries=bp_include_summaries,
+                )
+                st.success(f"Ready: {len(bp_converted)} schedule activities")
+                st.caption(
+                    f"Source activities: {bp_stats['Source rows']} | "
+                    f"Summary groups excluded: {bp_stats['Summary groups excluded']} | "
+                    f"Invalid dates: {bp_stats['Invalid date rows skipped']} | "
+                    f"Duration checks: {bp_stats['Duration mismatches']} mismatches"
+                )
+                st.dataframe(
+                    bp_converted[["Well_Name", "Area", "Rig", "Target_Type", "Start_Date", "End_Date", "Status"]].head(12),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+                if not bp_warnings.empty:
+                    with st.expander(f"Conversion QC ({len(bp_warnings)} observations)"):
+                        st.dataframe(bp_warnings, use_container_width=True, hide_index=True)
+                st.caption(
+                    "BP dates: the 'A' suffix indicates actual dates. "
+                    "BP Finish is treated as an exclusive boundary (adjusted by one day for SOCAR). "
+                    "BP has no explicit reservoir or rig number, so these are not invented."
+                )
+                bp_name = safe_filename_stem(bp_uploaded.name) + "_SOCAR.csv"
+                col_bp_download, col_bp_apply = st.columns(2)
+                col_bp_download.download_button(
+                    "⬇ Download SOCAR CSV",
+                    data=dataframe_to_csv_bytes(bp_converted),
+                    file_name=bp_name,
+                    mime="text/csv",
+                    use_container_width=True,
+                    key="bp_p10_csv_download",
+                )
+                if col_bp_apply.button(
+                    "✅ Apply to Scheduler",
+                    use_container_width=True,
+                    type="primary",
+                    key="bp_p10_apply",
+                ):
+                    set_master(bp_converted, add_undo=True)
+                    st.session_state.source_name = f"{bp_uploaded.name} → SOCAR"
+                    st.session_state.source_file_name = bp_name
+                    st.session_state.schedule_snapshot_id = save_schedule_snapshot(
+                        bp_converted, bp_name
+                    )
+                    st.session_state.selected_document_item_id = ""
+                    # Only clear data-specific filters; keep user's chart choices.
+                    revised_view = read_persisted_view_settings()
+                    for filter_name in (
+                        "search", "reservoirs", "areas", "rigs", "statuses",
+                        "priorities", "target_types", "campaigns", "owners",
+                        "date_window", "include_cancelled",
+                    ):
+                        revised_view.pop(filter_name, None)
+                    revised_view["source_file_name"] = bp_name
+                    revised_view["schedule_snapshot_id"] = st.session_state.schedule_snapshot_id
+                    write_persisted_view_settings(revised_view)
+                    st.session_state.filter_reset_token += 1
+                    st.session_state.pop("visible_columns_widget", None)
+                    st.rerun()
+            except Exception as exc:
+                st.error(f"BP P10 conversion failed: {type(exc).__name__}: {exc}")
 
     with st.expander("Linked PDF settings", expanded=False):
         document_folder_text = st.text_input(
@@ -3573,6 +3913,17 @@ with tab_help:
         10. Use **Reset defaults** to clear filters and chart settings while keeping
             the current schedule loaded.
 
+        ### BP → SOCAR P10 converter
+        Open **BP → SOCAR Converter (P10)** in the sidebar, upload the BP P10
+        Excel workbook, review the preview and conversion QC, then select
+        **Download SOCAR CSV** or **Apply to Scheduler**. Apply replaces the
+        current master schedule (Undo is available) and refreshes the Gantt.
+        The normal schedule uploader also recognizes this BP four-column format.
+        The converted file uses the existing SOCAR/NWD CSV column format.
+        BP schedule finish boundaries are converted to inclusive end dates.
+        Hierarchical summary rows are excluded by default; rigless leaf rows
+        remain included. Unprovided reservoir and rig IDs are never guessed.
+
         ### Linked-document filename matching
         The most reliable method is to populate `Document_File`, for example
         `R-1501_SoR.pdf`, and enter the preferred display label in `Document_Name`.
@@ -3617,4 +3968,4 @@ with tab_help:
     )
 
 st.divider()
-st.caption("NWD Scheduler v1.7.1 • Live viewers • Reliable PDF preview • Zoom-aware tooltips • Color legend")
+st.caption("NWD Scheduler v1.8 • BP P10 Converter • Live viewers • Reliable PDF preview • Zoom-aware tooltips • Color legend")
